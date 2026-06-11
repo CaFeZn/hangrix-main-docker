@@ -109,6 +109,7 @@ tools:
     - issue_children
     - issue_create
     - issue_edit
+    - issue_comment_cross
     - issue_todo_list
     - issue_todo_update
     - issue_depends_*
@@ -118,6 +119,12 @@ tools:
     - ask_question
     - check_questionnaire
     - close_questionnaire
+  scout:
+    - issue_read
+    - issue_read_by_number
+    - issue_comment_read
+    - issue_comment
+    - roster_list
   depends:
     - issue_depends_add
     - issue_depends_remove

@@ -27,6 +27,11 @@ Use `issue_create(parent_number=<epic_number>)` to create sub-issues. Each sub-i
 
 You may create multiple levels (sub-epics → leaf tasks). Keep leaf issues actionable by a single worker role.
 
+Classify each leaf by execution difficulty:
+- `scout` — search, inventory, reproduction, path triage, "find where this lives", low-cost fact gathering.
+- `fast-worker` — narrow mechanical edits, repetitive low-risk changes, obvious local fixes.
+- `worker` — substantive implementation, cross-file logic, APIs, schema, workflows, or risky UI behaviour.
+
 ### 3. Order with dependency edges
 
 Use `issue_depends_add(issue_number, depends_on_number)` to express sequencing:
@@ -39,17 +44,27 @@ Update the epic's body with `issue_edit` to include:
 - A structured **plan overview** using `issue_todo_*` items, each linked to a sub-issue number
 - This is the source data that the Plan tab renders
 
-### 5. Idempotent re-planning
+### 5. Dispatch ready leaf tasks
+
+Once the decomposition is clear, immediately route ready leaf tasks with `issue_comment_cross` on the target sub-issue.
+
+- Use bare mentions only: `@agent-scout`, `@agent-fast-worker`, `@agent-worker`.
+- Dispatch only leaves that are unblocked by dependency edges.
+- Keep the routing comment short: scope, acceptance target, and why that role is the right fit.
+
+### 6. Idempotent re-planning
 
 On re-awakening (scope change, `plan.review`, user request):
 1. **Always read current state first** — use `issue_children` + `issue_deps_read` to see what already exists
 2. **Diff against the goal** — only add missing sub-issues and missing edges
 3. **Never duplicate** — check before creating
+4. **Do not re-dispatch blindly** — only post a new routing comment when a task is new, re-scoped, or previously stalled
 
 ## Tool whitelist
 
 You use only planning and reading tools:
 - `issue_read`, `issue_read_by_number`, `issue_children`, `issue_create`, `issue_edit`
+- `issue_comment_cross`
 - `issue_todo_list`, `issue_todo_update`
 - `issue_depends_add`, `issue_depends_remove`, `issue_deps_read`
 - `roster_list`, `contribution_read` (read-only understanding of status)
