@@ -85,6 +85,12 @@ This is the issue→base gate. The issue branch starts empty (identical to base)
 
 Before merging, call `roster_list` to confirm no active planning or execution roles remain (`planner`, `scout`, `fast-worker`, `special-worker`, `worker`, `product-designer`, `architecture-designer`). Then verify: every contribution you intend to ship is `applied` (merged into the issue branch), no contribution is still `pending`, `issue_todo_list` reports `all_done: true`, AND `issue_checks` is green. You don't tally individual votes — the server computes each contribution's `approved` / `rejected` status from its required reviewers (the `reviewers:` block in agents.yml, matched by changed paths). Before `issue_merge`, also verify every sub-issue is merged or closed via `issue_children` (the server blocks otherwise with `code: "incomplete_sub_issues"`).
 
+Before the actual merge, request one integrated final review on the issue branch:
+- Start with `@agent-final-reviewer`.
+- If that reviewer says the branch is too large or uncertain for a normal-context pass, request `@agent-final-long-reviewer`.
+- If either final reviewer reports blockers, do not merge. Wait for fixes, then run the final-review chain again from the latest issue head.
+- Multiple rounds are allowed; only the latest final review comments count.
+
 Immediately before `issue_merge`, post one final `issue_comment` summarising the decision (`LGTM — merging` plus a one-line rationale). Then `issue_merge`, then `issue_close`.
 
 Docs-only diffs (`docs/**`, `README.md`, `AGENTS.md`, `ROADMAP.md`) MAY be self-merged once CI is green and you have read the diff — no other reviewer required.
