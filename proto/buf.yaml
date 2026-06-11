@@ -1,0 +1,21 @@
+# Single-module buf workspace at the repo root. All .proto for hangrix
+# lives under proto/hangrix/<service>/v<n>/ with one directory per
+# semantic version. Server + client (runner + agent) share the same
+# generated code; that's the whole point of having one source of truth.
+#
+# Lints + breaking detection are stricter than default — every change
+# goes through code review here, so catching foot-guns at `buf lint`
+# time is cheaper than catching them in a deploy bisect.
+version: v2
+modules:
+  - path: .
+lint:
+  use:
+    - STANDARD
+  except:
+    # Allow package = `hangrix.agent.v1` style even though it's not a
+    # versioned domain prefix — we're not publishing this anywhere.
+    - PACKAGE_VERSION_SUFFIX
+breaking:
+  use:
+    - FILE

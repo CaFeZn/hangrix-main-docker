@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hangrix.dev/schemas/workflows.schema.json",
+  "title": "Hangrix host repo .hangrix/workflows/<name>.yml",
+  "description": "Schema for one workflow file under .hangrix/workflows/. Mirrors docs/workflow-system.md §Schema(v1). The (not-yet-implemented) internal/workflowsconfig parser is the runtime contract; this schema is for editor validation only. Unknown top-level / job / step / event keys are STRICTLY rejected by the parser (workflow-system.md §严格校验规则) — additionalProperties:false matches that. v1: serial jobs, no needs/matrix, two step types (run, release).",
+  "type": "object",
+  "required": ["version", "name", "on", "jobs"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "Workflow key. Repo-unique. Used by API / run records / manual dispatch."
+    },
+    "on":   { "$ref": "#/$defs/on" },
+    "env":  { "$ref": "#/$defs/envMap" },
+    "jobs": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9-]*$" },
+      "additionalProperties": { "$ref": "#/$defs/job" }
+    }
+  },
+  "$defs": {
+    "envMap": {
+      "type": "object",
+      "description": "Plain-text env vars. Keys uppercase [A-Z_][A-Z0-9_]*; values support ${VAR_NAME} repo-variable expansion (runner-side).",
+      "patternProperties": { "^[A-Z_][A-Z0-9_]*$": { "type": "string" } },
+      "additionalProperties": false
+    },
+    "on": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "description": "Event subscription. At least one event. Five events in v1.",
+      "properties": {
+        "repo.push":         { "$ref": "#/$defs/onRepoPush" },
+        "repo.push_tag":     { "$ref": "#/$defs/onRepoPushTag" },
+        "issue.opened":      { "$ref": "#/$defs/onFilterless" },
+        "issue.comment":     { "$ref": "#/$defs/onIssueComment" },
+        "workflow.dispatch": { "$ref": "#/$defs/onWorkflowDispatch" }
+      }
+    },
+    "onFilterless": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "object", "additionalProperties": false, "maxProperties": 0 }
+      ]
+    },
+    "onRepoPush": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "branches":        { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "branches_ignore": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "paths":           { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "paths_ignore":    { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "onRepoPushTag": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "v1 supports tags / tags_ignore only — branches/paths variants are explicitly rejected (workflow-system.md §repo.push_tag).",
+      "properties": {
+        "tags":        { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "tags_ignore": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "onIssueComment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mentioned_only": {
+          "type": "boolean",
+          "description": "When true, fires only on @workflow-<name> mention (NOT @agent-<role> — see workflow-system.md note)."
+        },
+        "from_roles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,38}$" }
+        },
+        "from_users": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "onWorkflowDispatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "required": { "type": "boolean" } }
+          }
+        }
+      }
+    },
+    "job": {
+      "type": "object",
+      "required": ["steps"],
+      "additionalProperties": false,
+      "properties": {
+        "name":            { "type": "string", "maxLength": 200 },
+        "env":             { "$ref": "#/$defs/envMap" },
+        "timeout_minutes": { "type": "integer", "minimum": 1, "maximum": 1440 },
+        "dir":             { "type": "string", "pattern": "^/workspace(/|$)", "description": "Must live under /workspace." },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/step" }
+        }
+      }
+    },
+    "step": {
+      "oneOf": [
+        { "$ref": "#/$defs/stepRun" },
+        { "$ref": "#/$defs/stepRelease" }
+      ]
+    },
+    "stepRun": {
+      "type": "object",
+      "required": ["run"],
+      "additionalProperties": false,
+      "description": "type:run (default). `type` may be omitted or set to 'run'.",
+      "properties": {
+        "id":   { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "name": { "type": "string", "maxLength": 200 },
+        "type": { "const": "run" },
+        "run":  { "type": "string", "minLength": 1, "description": "Executed via bash -lc. Supports ${{ steps.<id>.outputs.<key> }} interpolation." },
+        "env":  { "$ref": "#/$defs/envMap" },
+        "dir":  { "type": "string", "description": "Relative to job dir or absolute." }
+      }
+    },
+    "stepRelease": {
+      "type": "object",
+      "required": ["type", "with"],
+      "additionalProperties": false,
+      "description": "type:release — runner-built-in step that calls the platform release API directly (no docker exec).",
+      "properties": {
+        "id":   { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "name": { "type": "string", "maxLength": 200 },
+        "type": { "const": "release" },
+        "with": {
+          "type": "object",
+          "required": ["tag"],
+          "additionalProperties": false,
+          "properties": {
+            "tag":   { "type": "string", "minLength": 1 },
+            "notes": { "type": "string" },
+            "draft": { "type": "boolean", "default": true },
+            "assets": {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  { "type": "string", "minLength": 1 },
+                  {
+                    "type": "object",
+                    "required": ["path"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "path": { "type": "string", "minLength": 1 },
+                      "name": { "type": "string", "minLength": 1 }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

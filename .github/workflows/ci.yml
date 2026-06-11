@@ -1,0 +1,78 @@
+# CI checker: runs on every contribution push and every contribution merge
+# (i.e. push to issue branch). Results surface via the Hangrix platform's
+# checker mechanism on contributions and issue branches respectively.
+#
+# Scope: validates the Go workspace (all three binaries compile, all
+# tests pass) and that the web app generates a static bundle that
+# hangrix can embed. We deliberately do NOT run vue-tsc here — there
+# are two pre-existing TS errors in FileDiffList.vue and
+# [owner]/[name]/index.vue that block the whole pipeline if treated
+# as errors; that's a known follow-up.
+name: CI
+
+on:
+  push:
+    branches:
+      - 'issue-*/**'    # contribution branches
+      - 'issue/*'       # issue branches (contributions applied)
+
+# Cancel in-flight runs when a newer push lands on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      # hangrix's web package //go:embed-s apps/hangrix/internal/web/
+      # dist via `all:dist`, which fails at compile time if the dir
+      # is empty. Generate the bundle first, then copy-web-dist.mjs
+      # both fills it AND writes a .gitkeep so even a generate-skip
+      # path still satisfies the embed.
+      - name: Generate web bundle
+        run: pnpm --filter web run generate
+
+      - name: Stage web dist into hangrix embed dir
+        run: node apps/hangrix/scripts/copy-web-dist.mjs
+
+      - name: Go test
+        # `./...` from the workspace root doesn't expand across go.work
+        # members — list each module's tree explicitly.
+        run: |
+          go test ./apps/hangrix/... \
+                  ./apps/hangrix-agent/... \
+                  ./apps/hangrix-runner/... \
+                  ./pkg/common/... \
+                  ./pkg/cryptobox/... \
+                  ./pkg/ioc/...
+
+      - name: Build hangrix (with embeds)
+        # Exercises the full embed pipeline: web dist + per-arch
+        # runner binaries (each with the matching agent embedded),
+        # then go build of the server. Output is discarded — we
+        # only care that it compiles end-to-end.
+        run: pnpm --filter hangrix run build

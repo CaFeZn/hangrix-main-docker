@@ -1,0 +1,796 @@
+<script setup lang="ts">
+import { computed, onMounted, ref, watch } from 'vue'
+import {
+  Box,
+  Check,
+  ChevronRight,
+  Copy,
+  Download,
+  FileText,
+  Folder,
+  GitBranch,
+  GitCommit,
+  KeyRound,
+  Sparkles,
+} from 'lucide-vue-next'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableRow,
+} from '@/components/ui/table'
+import RepoReadme from '@/components/repo/RepoReadme.vue'
+import SilenceBanner from '@/components/silence/SilenceBanner.vue'
+import { useSilence } from '@/composables/useSilence'
+import type { Commit, EntryWithCommit, TreeEntry, TreeView } from '~/types/repo'
+import { relativeTime } from '~/utils/time'
+
+definePageMeta({ layout: 'repo' })
+
+const { t } = useI18n()
+const route = useRoute()
+const router = useRouter()
+const { user } = useCurrentUser()
+
+const owner = computed(() => String(route.params.owner ?? ''))
+const name = computed(() => String(route.params.name ?? ''))
+useHead({ title: () => `${owner.value}/${name.value} - ${t('app.name')}` })
+
+setBreadcrumbs(() => [
+  { label: owner.value, to: `/${owner.value}/${name.value}` },
+  { label: name.value },
+])
+
+const { repo, error: repoError, load: loadRepo } = useRepo(() => owner.value, () => name.value)
+const {
+  refs,
+  emptyRepo,
+  error: refsError,
+  load: loadRefsFetch,
+} = useRepoRefs(() => owner.value, () => name.value)
+
+const { state: silence } = useSilence(() => owner.value, () => name.value)
+
+const tab = ref<'files' | 'commits'>((route.query.tab as any) === 'commits' ? 'commits' : 'files')
+
+const refTab = ref<'branches' | 'tags'>('branches')
+
+const currentRef = ref<string>('')
+const currentPath = ref<string>('')
+
+const treeView = ref<TreeView | null>(null)
+const treeError = ref<string | null>(null)
+const treeLoading = ref(false)
+
+const commits = ref<Commit[]>([])
+const commitsLoading = ref(false)
+const commitsError = ref<string | null>(null)
+const commitsOffset = ref(0)
+const hasMoreCommits = ref(false)
+const loadingMoreCommits = ref(false)
+
+
+const copied = ref(false)
+const copiedKey = ref<string | null>(null)
+
+// Clone URL uses the browser origin so it works whether dev (:3001 proxy) or prod.
+const cloneUrl = computed(() => {
+  if (!repo.value) return ''
+  const origin = import.meta.client ? window.location.origin : ''
+  return `${origin}/git/${repo.value.owner_username}/${repo.value.name}.git`
+})
+
+// Quick-setup snippets shown when the repo is empty. `main` matches the
+// init.defaultBranch most Git installs ship with today; the user can adapt.
+const createNewSnippet = computed(() => [
+  `echo "# ${name.value}" > README.md`,
+  `git init`,
+  `git add README.md`,
+  `git commit -m "first commit"`,
+  `git branch -M main`,
+  `git remote add origin ${cloneUrl.value}`,
+  `git push -u origin main`,
+].join('\n'))
+
+const pushExistingSnippet = computed(() => [
+  `git remote add origin ${cloneUrl.value}`,
+  `git branch -M main`,
+  `git push -u origin main`,
+].join('\n'))
+
+const hangrixInitUrl = computed(() => {
+  const origin = import.meta.client ? window.location.origin : ''
+  return `${origin}/hangrix-init.txt`
+})
+
+const agentInitPrompt = computed(() => {
+  const origin = import.meta.client ? window.location.origin : ''
+  const repoPath = `${owner.value}/${name.value}`
+  return [
+    `Initialize this Hangrix repository (${repoPath}) with proper Hangrix configuration.`,
+    '',
+    `First, read the Hangrix initialization reference at ${origin}/hangrix-init.txt.`,
+    '',
+    'Then:',
+    '1. Create `.hangrix/agents.yml` with a minimal team configuration for this project.',
+    '2. Create role prompt files under `.hangrix/prompts/` as needed.',
+    '3. Ensure the repository has a proper README.md if not already present.',
+    '4. Set up any necessary `.gitignore` and project scaffolding.',
+    '',
+    'Follow the conventions and avoidances in the reference document.',
+  ].join('\n')
+})
+
+const canManage = computed(() => {
+  if (!repo.value || !user.value) return false
+  return user.value.role === 'admin' || user.value.id === repo.value.owner_id
+})
+
+const breadcrumbParts = computed(() => {
+  if (!currentPath.value) return []
+  const parts = currentPath.value.split('/').filter(Boolean)
+  const acc: { name: string; path: string }[] = []
+  let p = ''
+  for (const seg of parts) {
+    p = p ? `${p}/${seg}` : seg
+    acc.push({ name: seg, path: p })
+  }
+  return acc
+})
+
+const branchList = computed(() => refs.value?.branches ?? [])
+const tagList = computed(() => refs.value?.tags ?? [])
+const entries = computed<EntryWithCommit[]>(() => treeView.value?.entries ?? [])
+const headCommit = computed<Commit | undefined>(() => treeView.value?.last_commit)
+const totalCommits = computed<number>(() => treeView.value?.total_commits ?? 0)
+
+async function loadRefs() {
+  await loadRefsFetch(true)
+  if (refsError.value) {
+    treeError.value = refsError.value
+    return
+  }
+  const qRef = route.query.ref ? String(route.query.ref) : ''
+  currentRef.value = qRef || refs.value?.default_branch || ''
+  currentPath.value = route.query.path ? String(route.query.path) : ''
+}
+
+async function loadTreeView() {
+  if (!currentRef.value || emptyRepo.value) {
+    treeView.value = null
+    return
+  }
+  treeLoading.value = true
+  treeError.value = null
+  try {
+    const data = await $fetch<TreeView>(
+      `/api/repos/${owner.value}/${name.value}/tree-view`,
+      {
+        credentials: 'include',
+        query: { ref: currentRef.value, path: currentPath.value },
+      },
+    )
+    treeView.value = data
+  } catch (e: any) {
+    treeError.value = e?.data?.error ?? t('repo.loadFailed')
+    treeView.value = null
+  } finally {
+    treeLoading.value = false
+  }
+}
+
+async function loadCommits(append = false) {
+  if (emptyRepo.value) {
+  commits.value = []
+  hasMoreCommits.value = false
+  return
+  }
+  const offset = append ? commits.value.length : 0
+  const limit = 50
+  if (append) {
+  loadingMoreCommits.value = true
+  } else {
+  commitsOffset.value = 0
+  commitsLoading.value = true
+  }
+  commitsError.value = null
+  try {
+  const data = await $fetch<Commit[]>(
+    `/api/repos/${owner.value}/${name.value}/commits`,
+    {
+    credentials: 'include',
+    query: {
+      ref: currentRef.value || undefined,
+      offset,
+      limit,
+    },
+    },
+  )
+  if (append) {
+    commits.value = commits.value.concat(data ?? [])
+  } else {
+    commits.value = data ?? []
+  }
+  hasMoreCommits.value = (data?.length ?? 0) >= limit
+  } catch (e: any) {
+  commitsError.value = e?.data?.error ?? t('repo.loadFailed')
+  if (!append) commits.value = []
+  } finally {
+  commitsLoading.value = false
+  loadingMoreCommits.value = false
+  }
+}
+
+async function loadMoreCommits() {
+  await loadCommits(true)
+}
+
+function onSelectRef(v: any) {
+  currentRef.value = String(v)
+  currentPath.value = ''
+  router.replace({ query: { ...route.query, ref: currentRef.value, path: undefined } })
+}
+
+function onBreadcrumbClick(p: string) {
+  currentPath.value = p
+  router.replace({ query: { ...route.query, ref: currentRef.value, path: p || undefined } })
+}
+
+function entryHref(entry: EntryWithCommit): string {
+  if (entry.kind === 'tree') {
+    const qs = new URLSearchParams()
+    if (currentRef.value) qs.set('ref', currentRef.value)
+    qs.set('path', entry.path)
+    return `/${owner.value}/${name.value}?${qs.toString()}`
+  }
+  if (entry.kind === 'blob' || entry.kind === 'executable') {
+    // GitHub-style: /<owner>/<name>/blob/<ref>/<path>
+    // Ref is encoded so branch names with `/` survive (e.g. `feature/x`
+    // becomes `feature%2Fx` — Vue Router decodes it back at param read).
+    // Path segments are encoded individually so `#` / `?` etc. don't bleed
+    // into the URL grammar, but `/` between segments stays literal.
+    const encRef = encodeURIComponent(currentRef.value || '')
+    const encPath = entry.path.split('/').map(encodeURIComponent).join('/')
+    return `/${owner.value}/${name.value}/blob/${encRef}/${encPath}`
+  }
+  return ''
+}
+
+function onEntryClick(entry: EntryWithCommit, ev: MouseEvent) {
+  if (entry.kind === 'tree') {
+    ev.preventDefault()
+    currentPath.value = entry.path
+    router.replace({ query: { ...route.query, ref: currentRef.value, path: entry.path } })
+  }
+}
+
+function entryIcon(kind: TreeEntry['kind']) {
+  switch (kind) {
+    case 'tree': return Folder
+    case 'symlink': return KeyRound
+    case 'submodule': return Box
+    default: return FileText
+  }
+}
+
+async function copyClone() {
+  if (!cloneUrl.value) return
+  try {
+    await navigator.clipboard.writeText(cloneUrl.value)
+    copied.value = true
+    setTimeout(() => { copied.value = false }, 1500)
+  } catch { /* ignore */ }
+}
+
+async function copySnippet(key: string, text: string) {
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    copiedKey.value = key
+    setTimeout(() => {
+      if (copiedKey.value === key) copiedKey.value = null
+    }, 1500)
+  } catch { /* ignore */ }
+}
+
+function shortSha(sha: string) {
+  return sha.slice(0, 7)
+}
+
+// archiveHref builds the `/api/repos/{owner}/{name}/archive/{ref}.{ext}`
+// URL the backend's getArchive handler streams. Segments of the ref are
+// encoded individually so `feature/x` stays readable in the URL.
+function archiveHref(format: 'zip' | 'targz'): string {
+  if (!currentRef.value) return ''
+  const encRef = currentRef.value.split('/').map(encodeURIComponent).join('/')
+  const ext = format === 'zip' ? 'zip' : 'tar.gz'
+  return `/api/repos/${owner.value}/${name.value}/archive/${encRef}.${ext}`
+}
+
+function archiveFilename(format: 'zip' | 'targz'): string {
+  const safeRef = (currentRef.value || 'HEAD').replace(/\//g, '-')
+  const ext = format === 'zip' ? 'zip' : 'tar.gz'
+  return `${name.value}-${safeRef}.${ext}`
+}
+
+function firstLine(msg: string | undefined) {
+  if (!msg) return ''
+  return msg.split('\n', 1)[0]
+}
+
+function formatDate(s: string) {
+  try {
+    return new Date(s).toLocaleString()
+  } catch {
+    return s
+  }
+}
+
+function rel(iso: string | undefined) {
+  return relativeTime(iso ?? null, t)
+}
+
+function authorInitial(c: Commit | undefined) {
+  return c?.author?.name?.charAt(0)?.toUpperCase() ?? '?'
+}
+
+watch(tab, (v) => {
+  router.replace({ query: { ...route.query, tab: v === 'files' ? undefined : v } })
+  if (v === 'commits' && commits.value.length === 0 && !commitsError.value) {
+    loadCommits()
+  }
+})
+
+watch(() => route.query.tab, (q) => {
+  const next = q === 'commits' ? 'commits' : 'files'
+  if (next !== tab.value) {
+    tab.value = next
+    if (next === 'commits' && commits.value.length === 0 && !commitsError.value) {
+      loadCommits()
+    }
+  }
+})
+
+watch(currentRef, () => {
+  if (!emptyRepo.value) {
+    loadTreeView()
+    if (tab.value === 'commits') loadCommits()
+  }
+})
+
+watch(currentPath, () => {
+  if (!emptyRepo.value) loadTreeView()
+})
+
+watch(() => route.query.path, (p) => {
+  const np = p ? String(p) : ''
+  if (np !== currentPath.value) currentPath.value = np
+})
+
+watch(() => route.query.ref, (r) => {
+  const nr = r ? String(r) : (refs.value?.default_branch ?? '')
+  if (nr && nr !== currentRef.value) currentRef.value = nr
+})
+
+// Sync refTab so the dropdown opens on the correct tab when currentRef changes.
+watch([currentRef, branchList, tagList], ([ref, branches, tags]) => {
+  if (ref && tags.some(t => t.name === ref)) {
+    refTab.value = 'tags'
+  } else {
+    refTab.value = 'branches'
+  }
+}, { immediate: true })
+
+onMounted(async () => {
+  await loadRepo()
+  if (!repoError.value) {
+    await loadRefs()
+    if (!emptyRepo.value) {
+      await loadTreeView()
+      if (tab.value === 'commits') await loadCommits()
+    }
+  }
+})
+</script>
+
+<template>
+  <div class="space-y-6">
+    <p v-if="repoError" class="text-sm text-destructive">
+      {{ repoError }}
+    </p>
+
+    <template v-if="repo">
+      <header class="space-y-2">
+        <div class="flex flex-wrap items-center gap-2">
+          <h1 class="text-2xl font-semibold tracking-tight">
+            <NuxtLink :to="`/${repo.owner_username}/${repo.name}`" class="hover:underline">
+              {{ repo.owner_username }} / {{ repo.name }}
+            </NuxtLink>
+          </h1>
+          <Badge :variant="repo.visibility === 'private' ? 'outline' : 'secondary'">
+            {{ t(`repo.visibility${repo.visibility === 'private' ? 'Private' : 'Public'}`) }}
+          </Badge>
+        </div>
+        <p v-if="repo.description" class="text-sm text-muted-foreground">
+          {{ repo.description }}
+        </p>
+      </header>
+
+      <SilenceBanner :state="silence" class="-mt-3" />
+
+      <Tabs v-model="tab" class="space-y-4">
+        <div class="flex flex-wrap items-center gap-3">
+          <TabsList>
+            <TabsTrigger value="files">
+              {{ t('repo.tabs.files') }}
+            </TabsTrigger>
+            <TabsTrigger value="commits">
+              {{ t('repo.tabs.commits') }}
+            </TabsTrigger>
+          </TabsList>
+          <!-- Clone URL pinned to the right of the tab strip, matching the
+               row height. Truncates for long URLs; copy button at the end. -->
+          <div class="ml-auto flex min-w-0 max-w-xl flex-1 items-center gap-2 rounded-md border bg-muted/30 px-2 py-1">
+            <span class="shrink-0 text-xs uppercase text-muted-foreground">{{ t('repo.cloneUrl') }}</span>
+            <code class="min-w-0 flex-1 truncate font-mono text-xs">{{ cloneUrl }}</code>
+            <Button size="sm" variant="ghost" class="h-7 shrink-0 gap-1 px-2" @click="copyClone">
+              <component :is="copied ? Check : Copy" class="size-3" />
+              {{ copied ? t('repo.copied') : t('repo.copy') }}
+            </Button>
+          </div>
+        </div>
+
+        <TabsContent value="files" class="space-y-4">
+          <div v-if="emptyRepo" class="space-y-4">
+            <div class="rounded-lg border border-dashed p-6 text-center">
+              <GitBranch class="mx-auto size-10 text-muted-foreground" />
+              <h2 class="mt-4 text-lg font-medium">
+                {{ t('repo.files.emptyRepo') }}
+              </h2>
+              <p class="mt-1 text-sm text-muted-foreground">
+                {{ t('repo.files.emptyRepoHint') }}
+              </p>
+            </div>
+
+            <Card class="gap-0 py-0">
+              <CardHeader class="border-b px-4 py-3">
+                <CardTitle class="flex items-center gap-2 text-sm font-medium">
+                  <Sparkles class="size-4" />
+                  {{ t('repo.agentInit.title') }}
+                </CardTitle>
+              </CardHeader>
+              <CardContent class="space-y-3 p-4">
+                <p class="text-sm text-muted-foreground">
+                  {{ t('repo.agentInit.hint') }}
+                </p>
+                <div>
+                  <div class="mb-1 flex items-center justify-between">
+                    <span class="text-xs font-medium">{{ t('repo.agentInit.promptLabel') }}</span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      class="h-7 gap-1 px-2"
+                      @click="copySnippet('agent-init', agentInitPrompt)"
+                    >
+                      <component :is="copiedKey === 'agent-init' ? Check : Copy" class="size-3" />
+                      {{ copiedKey === 'agent-init' ? t('repo.copied') : t('repo.copy') }}
+                    </Button>
+                  </div>
+                  <pre class="overflow-x-auto rounded-md bg-muted/30 p-3 font-mono text-xs leading-relaxed"><code>{{ agentInitPrompt }}</code></pre>
+                </div>
+                <a
+                  :href="hangrixInitUrl"
+                  target="_blank"
+                  class="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                >
+                  {{ t('repo.agentInit.refLink') }}
+                </a>
+              </CardContent>
+            </Card>
+
+            <Card class="gap-0 py-0">
+              <CardHeader class="border-b px-4 py-3">
+                <CardTitle class="text-sm font-medium">
+                  {{ t('repo.files.createFromScratch') }}
+                </CardTitle>
+              </CardHeader>
+              <CardContent class="p-0">
+                <div class="relative">
+                  <pre class="overflow-x-auto bg-muted/30 p-4 pr-14 font-mono text-xs leading-relaxed"><code>{{ createNewSnippet }}</code></pre>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    class="absolute right-2 top-2 h-7 gap-1 px-2"
+                    @click="copySnippet('new', createNewSnippet)"
+                  >
+                    <component :is="copiedKey === 'new' ? Check : Copy" class="size-3" />
+                    {{ copiedKey === 'new' ? t('repo.copied') : t('repo.copy') }}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card class="gap-0 py-0">
+              <CardHeader class="border-b px-4 py-3">
+                <CardTitle class="text-sm font-medium">
+                  {{ t('repo.files.pushExisting') }}
+                </CardTitle>
+              </CardHeader>
+              <CardContent class="p-0">
+                <div class="relative">
+                  <pre class="overflow-x-auto bg-muted/30 p-4 pr-14 font-mono text-xs leading-relaxed"><code>{{ pushExistingSnippet }}</code></pre>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    class="absolute right-2 top-2 h-7 gap-1 px-2"
+                    @click="copySnippet('existing', pushExistingSnippet)"
+                  >
+                    <component :is="copiedKey === 'existing' ? Check : Copy" class="size-3" />
+                    {{ copiedKey === 'existing' ? t('repo.copied') : t('repo.copy') }}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          <template v-else>
+            <div class="flex flex-wrap items-center gap-3">
+              <div class="flex items-center gap-2">
+                <GitBranch class="size-4 text-muted-foreground" />
+                <Select :model-value="currentRef" @update:model-value="onSelectRef">
+                  <SelectTrigger class="w-[220px]">
+                    <SelectValue :placeholder="t('repo.files.ref')" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <Tabs v-model="refTab" class="w-full">
+                      <TabsList class="w-full">
+                        <TabsTrigger value="branches" class="flex-1">
+                          {{ t('repo.tabs.branches') }}
+                        </TabsTrigger>
+                        <TabsTrigger value="tags" class="flex-1">
+                          {{ t('repo.tabs.tags') }}
+                        </TabsTrigger>
+                      </TabsList>
+                      <TabsContent value="branches" class="max-h-64 overflow-y-auto px-1">
+                        <template v-if="branchList.length > 0">
+                          <SelectItem v-for="b in branchList" :key="`b-${b.name}`" :value="b.name">
+                            {{ b.name }}
+                          </SelectItem>
+                        </template>
+                        <div v-else class="py-3 text-center text-sm text-muted-foreground">
+                          {{ t('repo.branches.empty') }}
+                        </div>
+                      </TabsContent>
+                      <TabsContent value="tags" class="max-h-64 overflow-y-auto px-1">
+                        <template v-if="tagList.length > 0">
+                          <SelectItem v-for="tg in tagList" :key="`t-${tg.name}`" :value="tg.name">
+                            {{ tg.name }}
+                          </SelectItem>
+                        </template>
+                        <div v-else class="py-3 text-center text-sm text-muted-foreground">
+                          {{ t('repo.tags.empty') }}
+                        </div>
+                      </TabsContent>
+                    </Tabs>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <DropdownMenu>
+                <DropdownMenuTrigger as-child>
+                  <Button size="sm" variant="outline" :disabled="!currentRef">
+                    <Download class="size-3" />
+                    {{ t('repo.archive.download') }}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start">
+                  <DropdownMenuItem as-child>
+                    <a :href="archiveHref('zip')" :download="archiveFilename('zip')">
+                      {{ t('repo.archive.zip') }}
+                    </a>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem as-child>
+                    <a :href="archiveHref('targz')" :download="archiveFilename('targz')">
+                      {{ t('repo.archive.targz') }}
+                    </a>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              <nav class="flex flex-wrap items-center gap-1 text-sm">
+                <button
+                  type="button"
+                  class="text-muted-foreground hover:text-foreground"
+                  @click="onBreadcrumbClick('')"
+                >
+                  {{ t('repo.files.rootBreadcrumb') }}
+                </button>
+                <template v-for="(part, idx) in breadcrumbParts" :key="part.path">
+                  <ChevronRight class="size-3 text-muted-foreground" />
+                  <button
+                    v-if="idx < breadcrumbParts.length - 1"
+                    type="button"
+                    class="text-muted-foreground hover:text-foreground"
+                    @click="onBreadcrumbClick(part.path)"
+                  >
+                    {{ part.name }}
+                  </button>
+                  <span v-else class="font-medium">{{ part.name }}</span>
+                </template>
+              </nav>
+            </div>
+
+            <Card class="gap-0 py-0">
+              <CardContent class="p-0">
+                <p v-if="treeError" class="p-3 text-sm text-destructive">
+                  {{ treeError }}
+                </p>
+                <p v-else-if="treeLoading" class="p-3 text-sm text-muted-foreground">
+                  {{ t('common.loading') }}
+                </p>
+                <template v-else>
+                  <!-- Top header strip: latest commit + N commits link -->
+                  <div
+                    v-if="headCommit"
+                    class="flex flex-wrap items-center gap-3 rounded-t-xl border-b bg-muted/40 px-4 py-2 text-sm"
+                  >
+                    <div class="flex size-6 shrink-0 items-center justify-center rounded-full bg-primary/10 text-xs font-medium text-primary">
+                      {{ authorInitial(headCommit) }}
+                    </div>
+                    <span class="shrink-0 font-medium">{{ headCommit.author.name }}</span>
+                    <NuxtLink
+                      :to="`/${owner}/${name}/commits/${headCommit.sha}`"
+                      class="min-w-0 flex-1 truncate text-muted-foreground hover:text-foreground hover:underline"
+                      :title="headCommit.message"
+                    >
+                      {{ firstLine(headCommit.message) }}
+                    </NuxtLink>
+                    <code class="hidden font-mono text-xs text-muted-foreground sm:inline">{{ shortSha(headCommit.sha) }}</code>
+                    <span class="text-xs text-muted-foreground" :title="formatDate(headCommit.committed_at)">
+                      {{ rel(headCommit.committed_at) }}
+                    </span>
+                    <NuxtLink
+                      :to="`/${owner}/${name}?tab=commits`"
+                      class="ml-auto inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground hover:underline"
+                    >
+                      <GitCommit class="size-3" />
+                      {{ t('repo.files.commitsCount', { n: totalCommits }) }}
+                    </NuxtLink>
+                  </div>
+
+                  <!-- Tree rows table -->
+                  <Table>
+                    <TableBody>
+                      <TableRow v-if="currentPath" class="cursor-pointer" @click="onBreadcrumbClick(breadcrumbParts.at(-2)?.path ?? '')">
+                        <TableCell class="w-[40%]">
+                          <span class="inline-flex items-center gap-2">
+                            <Folder class="size-4 text-muted-foreground" />
+                            <span class="font-mono">..</span>
+                          </span>
+                        </TableCell>
+                        <TableCell class="text-sm text-muted-foreground" />
+                        <TableCell class="text-right text-xs text-muted-foreground" />
+                      </TableRow>
+                      <TableRow v-for="entry in entries" :key="entry.path">
+                        <TableCell class="w-[40%]">
+                          <span class="inline-flex items-center gap-2">
+                            <component
+                              :is="entryIcon(entry.kind)"
+                              :class="['size-4', entry.kind === 'tree' ? 'text-sky-500' : 'text-muted-foreground']"
+                            />
+                            <template v-if="entry.kind === 'tree' || entry.kind === 'blob' || entry.kind === 'executable'">
+                              <NuxtLink
+                                :to="entryHref(entry)"
+                                class="truncate font-mono hover:underline"
+                                @click="(e: MouseEvent) => onEntryClick(entry, e)"
+                              >
+                                {{ entry.name }}
+                              </NuxtLink>
+                            </template>
+                            <template v-else>
+                              <span class="truncate font-mono text-muted-foreground" :title="entry.kind === 'submodule' ? t('repo.files.submoduleHint') : t('repo.files.symlinkHint')">
+                                {{ entry.name }}
+                              </span>
+                            </template>
+                          </span>
+                        </TableCell>
+                        <TableCell class="min-w-0 text-sm text-muted-foreground">
+                          <template v-if="entry.last_commit">
+                            <NuxtLink
+                              :to="`/${owner}/${name}/commits/${entry.last_commit.sha}`"
+                              class="block truncate hover:text-foreground hover:underline"
+                              :title="entry.last_commit.message"
+                            >
+                              {{ firstLine(entry.last_commit.message) }}
+                            </NuxtLink>
+                          </template>
+                          <template v-else>
+                            {{ t('repo.files.noLastCommit') }}
+                          </template>
+                        </TableCell>
+                        <TableCell class="text-right text-xs text-muted-foreground">
+                          <span :title="entry.last_commit ? formatDate(entry.last_commit.committed_at) : ''">
+                            {{ entry.last_commit ? rel(entry.last_commit.committed_at) : t('repo.files.noLastCommit') }}
+                          </span>
+                        </TableCell>
+                      </TableRow>
+                    </TableBody>
+                  </Table>
+                </template>
+              </CardContent>
+            </Card>
+
+            <RepoReadme
+              v-if="!currentPath"
+              :owner="owner"
+              :name="name"
+              :ref-name="currentRef"
+              :tree="entries"
+            />
+          </template>
+        </TabsContent>
+
+        <TabsContent value="commits" class="space-y-4">
+          <Card class="gap-0 py-0">
+            <CardContent class="p-0">
+              <p v-if="commitsError" class="p-3 text-sm text-destructive">
+                {{ commitsError }}
+              </p>
+              <p v-else-if="commitsLoading" class="p-3 text-sm text-muted-foreground">
+                {{ t('common.loading') }}
+              </p>
+              <p v-else-if="commits.length === 0" class="p-6 text-center text-sm text-muted-foreground">
+                {{ t('repo.commits.none') }}
+              </p>
+              <ul v-else class="divide-y">
+                <li v-for="c in commits" :key="c.sha" class="hover:bg-muted/30">
+                  <NuxtLink
+                    :to="`/${owner}/${name}/commits/${c.sha}`"
+                    class="flex items-center gap-3 px-4 py-2.5"
+                  >
+                    <GitCommit class="size-4 shrink-0 text-muted-foreground" />
+                    <div class="min-w-0 flex-1">
+                      <p class="truncate text-sm font-medium">{{ firstLine(c.message) }}</p>
+                      <p class="text-xs text-muted-foreground">
+                        {{ c.author.name }} · {{ formatDate(c.committed_at) }}
+                      </p>
+                    </div>
+                    <code class="hidden font-mono text-xs text-muted-foreground sm:inline">{{ shortSha(c.sha) }}</code>
+                  </NuxtLink>
+                </li>
+  </ul>
+  <div v-if="!commitsLoading && hasMoreCommits" class="border-t px-4 py-2">
+  <Button
+  variant="ghost"
+  size="sm"
+  class="w-full"
+  :disabled="loadingMoreCommits"
+  @click="loadMoreCommits"
+  >
+  {{ loadingMoreCommits ? t('repo.commits.loadingMore') : t('repo.commits.loadMore') }}
+  </Button>
+  </div>
+  </CardContent>
+  </Card>
+  </TabsContent>
+      </Tabs>
+    </template>
+  </div>
+</template>

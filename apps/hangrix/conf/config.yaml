@@ -1,0 +1,54 @@
+server:
+  addr: ":8080"
+  # Public base URL for endpoint advertisement (runner bootstrap, agent
+  # env injection, future webhooks). Empty defers to the request host —
+  # fine for `go run ./cmd/hangrix` in a vanilla dev shell. Set
+  # explicitly in production so the value is reachable from the network
+  # the agent containers live on.
+  url: ""
+
+database:
+  dsn: "postgres://hangrix:hangrix@postgres:5432/hangrix?sslmode=disable"
+  # `migrate: true` runs each module's goose `up` at server boot (the
+  # local-dev path — one DSN that owns the schema). Flip to `false` on
+  # production deploys where the runtime DB user has no CREATE on the
+  # `public` schema (the PG 15+ default) and schema DDL is applied
+  # out-of-band by a privileged migrator role.
+  migrate: true
+
+redis:
+  addr: "redis:6379"
+  password: ""
+  db: 0
+
+auth:
+  cookie_name: "hangrix_session"
+  cookie_secure: false
+  session_ttl: "168h"
+
+storage:
+  repos_path: "./data/repos"
+  assets_path: "./data/assets"
+  attachments_path: "./data/attachments"
+
+llm:
+  encryption_key: "wAO53V1ifCfBbm5ZVmjR9haeymmvhIobK4b99+D4Eq8="
+  # Hard-delete llm_usage_log rows whose created_at is older than this.
+  # Default 168h (7 days). Set shorter to reclaim disk faster; set longer
+  # to keep usage data for analysis.
+  usage_retention: "168h"
+  # How often the background reaper wakes up. Default 1h — the gate is
+  # 7 days, so even a 4-hour interval would still hit rows well before
+  # the next boundary. One hour leaves room for an operator to shorten
+  # retention without re-tuning the interval.
+  usage_cleanup_interval: "1h"
+
+runner:
+  # Fallback image the runner pulls when a session doesn't pin one.
+  # The real session-spawn path drives this per-role from the host
+  # repo's `.hangrix/agents.yml`, so this is rarely hit.
+  default_agent_image: "ubuntu:24.04"
+
+automation:
+  # Interval between scheduler scans for automation tasks.
+  scanner_interval: "60s"

@@ -1,0 +1,12 @@
+{
+  "name": "hangrix",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "node ./scripts/copy-web-dist.mjs && exec air -c .air.toml",
+    "embed-binaries": "node ./scripts/build-embed-binaries.mjs",
+    "build": "node ./scripts/copy-web-dist.mjs && node ./scripts/build-embed-binaries.mjs && go build -o bin/ ./cmd/hangrix",
+    "test": "go test ./...",
+    "lint": "go vet ./..."
+  }
+}

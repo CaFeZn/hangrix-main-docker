@@ -1,0 +1,26 @@
+# buf generate config. Outputs into /gen/go/ at the repo root, which is
+# then imported as a separate Go module (see /gen/go/go.mod). Both
+# server (apps/hangrix) and clients (apps/hangrix-runner, hangrix-agent)
+# depend on the gen module via go.work — no copy/paste, no drift.
+#
+# Plugins are local binaries installed via `go install` (see proto/
+# README for the install lines). Pinning to remote BSR plugins would
+# work too but requires network on every generate; local keeps the dev
+# loop offline.
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/hangrix/hangrix/gen/go
+plugins:
+  - local: protoc-gen-go
+    out: ../gen/go
+    opt:
+      - paths=source_relative
+  - local: protoc-gen-connect-go
+    out: ../gen/go
+    opt:
+      - paths=source_relative
+inputs:
+  - directory: .

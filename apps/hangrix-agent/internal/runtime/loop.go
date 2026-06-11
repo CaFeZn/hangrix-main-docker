@@ -1,0 +1,1226 @@
+package runtime
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/hangrix/hangrix/apps/hangrix-agent/internal/llm"
+	"github.com/hangrix/hangrix/apps/hangrix-agent/internal/tools"
+	"github.com/hangrix/hangrix/apps/hangrix-agent/internal/tools/local"
+	"github.com/hangrix/hangrix/apps/hangrix-agent/internal/tools/platform"
+	agentv1 "github.com/hangrix/hangrix/gen/go/hangrix/agent/v1"
+)
+
+const atMentionReminder = "<system_reminder>Your last assistant message contains an `@`. If you meant to mention another role (e.g. `@agent-<role-key>`) or post to the issue thread, call the `issue_comment` tool and put the text in its `body` argument — plain assistant text is recorded on the session timeline but does NOT wake other roles or post a comment. If the `@` was incidental (an email address, a code snippet), ignore this reminder and continue.</system_reminder>"
+
+const futureTenseReminder = "<system_reminder>Your last assistant message described future action (e.g. \"I'll continue …\", \"next I'll …\", \"我会去做 …\", \"继续中 …\") but emitted NO tool call. The runtime treats a turn with no tool call as \"task fully handled, go idle\" — your stated intent will NOT be executed. Either: (a) call the tool(s) needed to take that action NOW in this turn, or (b) if you actually intended to stop here, say so explicitly (\"Done.\" / \"完成。\" + brief reason) so the closure is unambiguous.</system_reminder>"
+
+// futureTensePatterns are substrings whose presence in an assistant
+// turn's plain text — alongside ZERO tool calls — almost always
+// indicates the model promised forward action without taking it.
+// Reasoning models (Claude with extended thinking, OpenAI o-series,
+// DeepSeek-R1) periodically narrate "I'll continue / next I'll …" and
+// then end the turn; baseline.md forbids this, but a prompt rule alone
+// is not 100 % reliable, so the loop nudges once per turn as backup.
+//
+// Patterns are deliberately distinctive multi-token phrases — short
+// fragments like "next" or "我会" on their own would fire on legitimate
+// closure messages ("done, I'll let you know if X" → false positive).
+// Matched case-insensitively for English; Chinese is matched verbatim.
+var futureTensePatterns = []string{
+	// English — committing to forward action
+	"i'll continue",
+	"i will continue",
+	"let me continue",
+	"next i'll",
+	"next, i'll",
+	"next i will",
+	"let me start",
+	"let me begin",
+	"let me proceed",
+	"i'll start by",
+	"i'll begin by",
+	"i'll proceed",
+	"i'll go ahead",
+	"i will go ahead",
+	"going to start",
+	// Chinese — committing to forward action
+	"继续中",
+	"我会去",
+	"我会先",
+	"我会做",
+	"我会按",
+	"我将去",
+	"我将先",
+	"我将按",
+	"接下来我",
+	"下一步我",
+	"接下来将",
+	"下面我",
+	"准备开始",
+}
+
+// containsFutureTenseAction reports whether the assistant text reads
+// like a commitment to keep working in a subsequent turn (which won't
+// happen unless this turn also emits a tool call). Returns false on
+// empty input so the empty-response guard handles that case alone.
+func containsFutureTenseAction(content string) bool {
+	if content == "" {
+		return false
+	}
+	lower := strings.ToLower(content)
+	for _, p := range futureTensePatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Loop owns the message-pump that ties the wire transport, LLM and
+// tools together. It reads inbound frames from `in`, drives the LLM,
+// dispatches tool calls, and emits outbound frames on `out`.
+// Single-instance; not safe to call Run concurrently with itself.
+//
+// Lifecycle. Under the workflow-spawner model each wake = one fresh
+// container that drains events for at most idleGrace before exiting.
+// After each event finishes, the loop emits a runtime-internal `idle`
+// signal (no-op under Connect) and parks on the inbox waiting for
+// either the next event/control frame or an async notification.
+//
+// Inbox model. The loop reacts to two asynchronous sources:
+//   - proto frames from the server stream (relayed through `inbox`)
+//   - background-task completion notifications from AsyncLifecycle
+//     (selected directly from NotificationCh)
+//
+// Both are consumed at the same select level as the in-flight LLM call,
+// which is the key property: a notification raised mid-LLM-call still
+// lands in the context for the next round instead of waiting for a fresh
+// wake. Frames that arrive mid-event (a second event queued behind the
+// current one) are buffered into pendingItems and replayed at the next
+// idle.
+type Loop struct {
+	in       frameSource
+	out      frameSink
+	llm      *llm.Client
+	model    string
+	registry *tools.Registry
+	system   string
+	async    local.AsyncLifecycle
+
+	// reasoningEffort is the per-session thinking-budget tag forwarded on
+	// every llm.Create request as `reasoning.effort`. Sourced from
+	// HANGRIX_LLM_REASONING_EFFORT (set by the runner from agents.yml's
+	// role.llm.reasoning_effort or team-level fallback). Empty means
+	// the field is omitted on the wire and the upstream applies its
+	// model default.
+	reasoningEffort string
+
+	// thinking is the Anthropic thinking-mode toggle ("adaptive" /
+	// "enabled" / "disabled"), sourced from HANGRIX_LLM_THINKING. The
+	// agent forwards it on the proxy wire as the top-level `thinking`
+	// field; only the Anthropic upstream adapter consumes it. Empty =
+	// omit on the wire (upstream default — no thinking on Claude 4.7+).
+	thinking string
+
+	// maxToolRounds caps how many LLM⇄tool round-trips we allow within
+	// one inbound event. The cap exists only as a runaway-loop fail-safe;
+	// in practice an agent should never approach it. Lifted to a very
+	// large number so legitimate long sessions (refactors that touch
+	// many files, multi-step debugging) don't get cut off mid-stream.
+	maxToolRounds int
+
+	// shutdownGrace bounds how long Cleanup waits for async work
+	// (background bash tasks, sleep timers) to finish on shutdown before
+	// we exit anyway. The container teardown will reap whatever is left;
+	// this just keeps the exit path from wedging.
+	shutdownGrace time.Duration
+
+	// compactTokenThreshold is the input-token usage above which the
+	// loop injects a synthetic system reminder telling the LLM to call
+	// compact_session at the next safe boundary. 0 disables the nudge —
+	// the LLM still decides on its own when compact_session is right.
+	compactTokenThreshold int
+
+	// lastInputTokens is the most recent CreateResponse.Usage.InputTokens.
+	// We sample it after every LLM call so the compact-threshold check
+	// runs against the actual prompt size we just paid for, not an
+	// estimate. Reset to 0 each time compact_session lands so a single
+	// crossing doesn't fire the nudge twice.
+	lastInputTokens int
+
+	// compactNudged guards against repeatedly injecting the same
+	// "compact your session now" reminder turn after turn while the
+	// LLM is still mid-task and hasn't reached a point where it can
+	// safely call compact_session. We arm it once when the threshold
+	// is first crossed and disarm it after the next compact_session
+	// invocation OR a hard reset of the context window.
+	compactNudged bool
+
+	// reasoningTimeout is the per-call wall-clock ceiling for a single
+	// llm.Create() invocation. When exceeded the agent cancels the
+	// request and — if retries remain — retries with the same snapshot.
+	// <=0 disables this protection.
+	reasoningTimeout time.Duration
+	// reasoningTimeoutRetries is the number of retries AFTER the first
+	// timeout (total attempts = retries + 1). Only reasoning-timeout
+	// errors are retried at this level.
+	reasoningTimeoutRetries int
+
+	// suspended is set true when the agent receives a control:suspend
+	// frame (e.g. repo-level silence). While suspended the loop defers
+	// all event and notification processing; only control frames
+	// (resume, shutdown) are consumed. Set back to false by
+	// control:resume.
+	suspended bool
+}
+
+func NewLoop(
+	in frameSource,
+	out frameSink,
+	llmClient *llm.Client,
+	model string,
+	registry *tools.Registry,
+	systemPrompt string,
+	async local.AsyncLifecycle,
+	compactTokenThreshold int,
+	reasoningTimeout time.Duration,
+	reasoningTimeoutRetries int,
+	reasoningEffort string,
+	thinking string,
+) *Loop {
+	return &Loop{
+		in:                      in,
+		out:                     out,
+		llm:                     llmClient,
+		model:                   model,
+		registry:                registry,
+		system:                  systemPrompt,
+		async:                   async,
+		maxToolRounds:           999999,
+		shutdownGrace:           5 * time.Second,
+		compactTokenThreshold:   compactTokenThreshold,
+		reasoningTimeoutRetries: reasoningTimeoutRetries,
+		reasoningTimeout:        reasoningTimeout,
+		reasoningEffort:         reasoningEffort,
+		thinking:                thinking,
+	}
+}
+
+// inboxItem is one thing the loop reacts to from the transport side.
+// Exactly one of Frame / Notification / ReaderErr is populated per item.
+// In production the notification path is usually selected directly from
+// AsyncLifecycle.NotificationCh(); Notification remains on the struct so
+// tests and helper paths can still route it through applyInboxItem.
+//
+// Frame carries the raw streamed proto envelope; the loop switches on
+// the oneof Body to decide between event / control / unknown.
+type inboxItem struct {
+	Frame        *agentv1.StreamInputsResponse
+	Notification string
+	ReaderErr    error
+}
+
+func (l *Loop) notificationCh() <-chan string {
+	if l.async == nil {
+		return nil
+	}
+	return l.async.NotificationCh()
+}
+
+// Run blocks until shutdown or the input stream closes. The initial
+// session history is fetched up-front via a unary FetchHistory call;
+// subsequent events / control frames arrive on the server-streaming
+// subscription that pumpFrames drains.
+//
+// Shutdown fires exactly once at exit (any path — clean EOF, control:
+// shutdown, ctx cancel, fatal LLM error). Under Connect transport
+// this POSTs MarkIdle so the spawner sees status=idle and routes the
+// next trigger to a fresh workflow_run instead of trying to enqueue
+// onto this dead container. Failures are swallowed-with-log: a missed
+// MarkIdle is recoverable via the cleanup reaper, while propagating
+// the error would shadow whatever Loop.Run actually returned.
+func (l *Loop) Run(ctx context.Context) error {
+	defer func() {
+		if err := l.out.Shutdown(); err != nil {
+			fmt.Fprintf(os.Stderr, "runtime: shutdown signal: %v\n", err)
+		}
+	}()
+	history, err := l.in.FetchHistory(ctx)
+	if err != nil {
+		return fmt.Errorf("runtime: fetch history: %w", err)
+	}
+	msgs := historyToMessages(history)
+	msgs = trimTrailingDanglingToolCalls(msgs)
+	cctx := NewContext(l.system, msgs)
+
+	_ = l.out.Status("ready")
+
+	// Start the inbound-frame pump. Async completion notifications are
+	// read directly off AsyncLifecycle.NotificationCh() in the main loop
+	// and during mid-turn waits, rather than relayed through a second
+	// goroutine. That keeps the notification buffered at exactly one
+	// layer, which matters for sleep/bash wake-ups near the idle-grace
+	// boundary.
+	inbox := make(chan inboxItem, 64)
+	go l.pumpFrames(ctx, inbox)
+
+	// pendingItems holds non-event items that arrived while we were
+	// busy with an event (or a deferred reader-error sentinel). They
+	// are replayed at the next idle so a queued shutdown isn't lost
+	// to the order of events; queued event frames are similarly
+	// replayed and processed back-to-back.
+	var pendingItems []inboxItem
+
+	for {
+		// Replay any items the inner loop deferred. They go through
+		// the same handlers as freshly-received items so the
+		// control / event branch only lives in one place.
+		if len(pendingItems) > 0 {
+			next := pendingItems[0]
+			pendingItems = pendingItems[1:]
+			if next.ReaderErr != nil {
+				if errors.Is(next.ReaderErr, io.EOF) {
+					return nil
+				}
+				return fmt.Errorf("runtime: read inbound: %w", next.ReaderErr)
+			}
+			done, err := l.handleFrame(ctx, cctx, next.Frame, inbox, &pendingItems)
+			if err != nil {
+				return err
+			}
+			if done {
+				return nil
+			}
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case item, ok := <-inbox:
+			if !ok {
+				// Inbox closed = frame pump shut. Nothing more can drive us
+				// except async notifications, which are read directly from
+				// NotificationCh() in the sibling select case below.
+				return nil
+			}
+			switch {
+			case item.ReaderErr != nil:
+				if errors.Is(item.ReaderErr, io.EOF) {
+					return nil
+				}
+				return fmt.Errorf("runtime: read inbound: %w", item.ReaderErr)
+			case item.Frame != nil:
+				done, err := l.handleFrame(ctx, cctx, item.Frame, inbox, &pendingItems)
+				if err != nil {
+					return err
+				}
+				if done {
+					return nil
+				}
+			}
+		case msg, ok := <-l.notificationCh():
+			if !ok {
+				continue
+			}
+			if l.suspended {
+				// Drop notification while suspended — the agent
+				// is paused and should not react to background-task
+				// completions or sleep expiry. Deferring is impractical
+				// since notifications carry no replay semantics; if a
+				// long-running bash task finished during silence, the
+				// agent will see the exit status on the next manual
+				// poll after resume.
+				_ = l.out.Log("debug", fmt.Sprintf("dropped notification while suspended: %s", msg))
+				continue
+			}
+			// A notification arrived while idle: drive an event-style
+			// turn so the LLM gets a chance to react. The notification
+			// text becomes a user-role message; the LLM may poll a
+			// task_id, send bash_input, or simply acknowledge before
+			// returning to idle.
+			cctx.AppendUser(msg)
+			if err := l.driveOneTurn(ctx, cctx, inbox, &pendingItems); err != nil {
+				return err
+			}
+			if err := l.emitIdle(); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// handleFrame dispatches a single inbound frame. Returns (true, nil)
+// when the frame caused the loop to terminate (e.g. control:shutdown).
+// pendingItems is the spillover slice for non-event items the inner
+// event loop deferred — handleFrame appends to it, never reads from it
+// (Run drains it before the next select).
+func (l *Loop) handleFrame(
+	ctx context.Context,
+	cctx *Context,
+	frame *agentv1.StreamInputsResponse,
+	inbox <-chan inboxItem,
+	pendingItems *[]inboxItem,
+) (done bool, err error) {
+	switch body := frame.GetBody().(type) {
+	case *agentv1.StreamInputsResponse_Control:
+		switch body.Control.GetOp() {
+		case agentv1.ControlFrame_OP_SHUTDOWN:
+			l.gracefulShutdown()
+			return true, nil
+		case agentv1.ControlFrame_OP_SUSPEND:
+			l.suspended = true
+			_ = l.out.Suspended(body.Control.GetExpectedExitAt())
+			return false, nil
+		case agentv1.ControlFrame_OP_RESUME:
+			l.suspended = false
+			_ = l.out.Status("ready")
+			return false, nil
+		default:
+			_ = l.out.Log("warn", fmt.Sprintf("unknown control op: %v", body.Control.GetOp()))
+			return false, nil
+		}
+	case *agentv1.StreamInputsResponse_Event:
+		if l.suspended {
+			// Defer the event until resumed; we're in a silence window.
+			*pendingItems = append(*pendingItems, inboxItem{Frame: frame})
+			return false, nil
+		}
+		if err := l.handleEvent(ctx, cctx, body.Event, inbox, pendingItems); err != nil {
+			return false, err
+		}
+		if err := l.emitIdle(); err != nil {
+			return false, err
+		}
+		return false, nil
+	default:
+		_ = l.out.Log("warn", "unknown inbound frame body")
+		return false, nil
+	}
+}
+
+// gracefulShutdown is the control:shutdown handler. We cancel every
+// alive background bash task, wait up to shutdownGrace for them to
+// reap, then return so Run can exit. Container teardown will sweep
+// whatever is left.
+func (l *Loop) gracefulShutdown() {
+	if l.async == nil {
+		return
+	}
+	if l.async.HasRunningJobs() == 0 {
+		return
+	}
+	gctx, cancel := context.WithTimeout(context.Background(), l.shutdownGrace)
+	defer cancel()
+	l.async.Cleanup(gctx)
+}
+
+// emitIdle reports event-done state to the sink along with a hint
+// about how many async work items (bash jobs + sleep timers) are
+// still alive. Under the Connect transport this is a local-only
+// signal — see frameSink.Shutdown for the per-wake counterpart.
+func (l *Loop) emitIdle() error {
+	n := 0
+	if l.async != nil {
+		n = l.async.HasRunningJobs()
+	}
+	return l.out.Idle(n)
+}
+
+func (l *Loop) handleEvent(
+	ctx context.Context,
+	cctx *Context,
+	event *agentv1.EventFrame,
+	inbox <-chan inboxItem,
+	pendingItems *[]inboxItem,
+) error {
+	// Resolve the effective event kind. The server sends questionnaire
+	// answer / close events as issue.comment with cause_kind embedded
+	// in the payload rather than a dedicated event type. Detect that
+	// here so the LLM sees the correct event kind and the timeout
+	// schedule is cancelled.
+	eventKind := event.GetEvent()
+	payload := json.RawMessage(event.GetPayload())
+	if qk := questionnaireEventKind(payload); qk != "" {
+		l.cancelQuestionnaireSchedule(payload)
+		eventKind = qk
+	}
+
+	turnID := newTurnID()
+	eventMsg, err := renderEventMessage(eventKind, payload)
+	if err != nil {
+		_ = l.out.Log("error", fmt.Sprintf("render event: %s", err))
+		_ = l.out.Done(turnID)
+		// Render failure means the inbound frame was malformed; that's
+		// a platform-side bug, not a transient issue worth retrying.
+		// Bubble up so the runner records the session as failed.
+		return fmt.Errorf("render event: %w", err)
+	}
+	cctx.AppendUser(eventMsg)
+	return l.driveOneTurnWithID(ctx, cctx, inbox, pendingItems, turnID)
+}
+
+// driveOneTurn runs the LLM ⇄ tool round-trip loop until the assistant
+// returns no tool calls (event finished) or the cap is reached. Used
+// when an idle-state notification kicks off a turn without an inbound
+// event frame.
+func (l *Loop) driveOneTurn(
+	ctx context.Context,
+	cctx *Context,
+	inbox <-chan inboxItem,
+	pendingItems *[]inboxItem,
+) error {
+	return l.driveOneTurnWithID(ctx, cctx, inbox, pendingItems, newTurnID())
+}
+
+func (l *Loop) driveOneTurnWithID(
+	ctx context.Context,
+	cctx *Context,
+	inbox <-chan inboxItem,
+	pendingItems *[]inboxItem,
+	turnID string,
+) error {
+	// atMentionNudged is scoped per-turn so a fresh event can re-arm the
+	// reminder. We fire at most once within a turn to avoid wedging the
+	// loop on a model that keeps echoing `@` in plain text.
+	atMentionNudged := false
+	// futureTenseNudged is the per-turn one-shot for the
+	// "model promised to continue but emitted no tool call" guard. Same
+	// rationale as atMentionNudged — fire at most once so a model that
+	// keeps narrating intent without acting doesn't trap the loop in an
+	// infinite re-prompt; after the first nudge, if the model still
+	// ends the turn with text-only, we let it close.
+	futureTenseNudged := false
+	// emptyResponseRetries counts consecutive LLM responses that came
+	// back with no assistant content AND no tool calls. Observed in the
+	// wild on OpenAI Response API reasoning models after a few rounds
+	// of tool-call history: upstream returns 2xx with `status:"completed"`
+	// but `output:null` even though usage.output_tokens > reasoning_tokens
+	// (so non-reasoning tokens WERE produced — they just never made it
+	// into any output item). Root cause is upstream/gateway-side; we
+	// don't know which. Without a guard the default "no tool calls →
+	// turn done" branch silently abandons the task. Reset to 0 on any
+	// non-empty response.
+	emptyResponseRetries := 0
+	for round := 0; round < l.maxToolRounds; round++ {
+		// Drain anything the inbox accumulated since the last round
+		// boundary. Non-blocking — we only consume what's already
+		// queued. Events and notifications fold straight into the
+		// context so the LLM sees them this round; control frames
+		// defer to the outer loop.
+		l.drainPending(cctx, inbox, pendingItems)
+
+		// Threshold-based compact nudge. Fires once per crossing —
+		// armed when the last LLM call's input-token count went above
+		// the configured threshold, disarmed by an actual
+		// compact_session call. The nudge is a synthetic user-role
+		// reminder; the LLM is still free to finish its current
+		// sub-step before calling the tool. We deliberately do NOT
+		// force a compact here — interrupting a mid-task LLM with a
+		// hard cutover wastes whatever decisions it was carrying.
+		l.maybeNudgeCompact(cctx)
+
+		// Snapshot the message count so we can detect whether a new
+		// event or notification was folded in while the LLM was busy.
+		// If it was and the LLM returns no tool calls, we need to give
+		// it another round to react instead of declaring the turn done.
+		preCallLen := cctx.Len()
+
+		_ = l.out.Status("thinking")
+		req := &llm.CreateRequest{
+			Model:           l.model,
+			Instructions:    cctx.SystemPrompt(),
+			Messages:        cctx.Snapshot(),
+			Tools:           l.registry.Catalog(),
+			ReasoningEffort: l.reasoningEffort,
+			Thinking:        l.thinking,
+		}
+
+		// Reasoning-timeout retry loop. Each attempt runs the LLM
+		// call in its own goroutine with a per-call deadline so the
+		// main goroutine can keep draining the inbox. An event or
+		// notification arriving mid-call is appended to the context
+		// but does NOT cancel the call — canceling would waste tokens,
+		// and the new input will be visible at the next round. Only
+		// DeadlineExceeded errors trigger a retry with the same
+		// request snapshot; transport/5xx/429 errors remain in
+		// llm.Client.Create's internal retry layer.
+		maxAttempts := l.reasoningTimeoutRetries + 1
+		if maxAttempts < 1 {
+			maxAttempts = 1
+		}
+
+		var (
+			resp    *llm.CreateResponse
+			callErr error
+		)
+
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			callCtx := ctx
+			var cancel context.CancelFunc
+			if l.reasoningTimeout > 0 {
+				callCtx, cancel = context.WithTimeout(ctx, l.reasoningTimeout)
+				defer cancel()
+			}
+
+			respCh := make(chan llmResult, 1)
+			go func() {
+				r, err := l.llm.Create(callCtx, req)
+				respCh <- llmResult{resp: r, err: err}
+			}()
+
+			waitForResp := true
+			for waitForResp {
+				select {
+				case <-ctx.Done():
+					if cancel != nil {
+						cancel()
+					}
+					return ctx.Err()
+				case r := <-respCh:
+					resp = r.resp
+					callErr = r.err
+					waitForResp = false
+					if cancel != nil {
+						cancel()
+					}
+				case item, ok := <-inbox:
+					if !ok {
+						r := <-respCh
+						resp = r.resp
+						callErr = r.err
+						waitForResp = false
+						if cancel != nil {
+							cancel()
+						}
+						continue
+					}
+					l.applyInboxItem(cctx, item, pendingItems)
+				case msg, ok := <-l.notificationCh():
+					if !ok {
+						continue
+					}
+					l.applyInboxItem(cctx, inboxItem{Notification: msg}, pendingItems)
+				}
+			}
+
+			if callErr == nil {
+				break
+			}
+			if !errors.Is(callErr, context.DeadlineExceeded) {
+				break
+			}
+			if l.reasoningTimeout <= 0 {
+				break
+			}
+		}
+
+		// Catch anything that landed between respCh receiving and now —
+		// otherwise an event queued in the final nanoseconds of the call
+		// would only be visible *after* the no-tool-call termination
+		// check below, which would silently drop it into the next turn.
+		l.drainPending(cctx, inbox, pendingItems)
+		postCallLen := cctx.Len()
+
+		if callErr != nil {
+			// Reasoning timeout after all retries exhausted.
+			if errors.Is(callErr, context.DeadlineExceeded) && l.reasoningTimeout > 0 {
+				timeoutMsg := fmt.Sprintf("LLM reasoning timeout after %d attempt(s), threshold=%ds", maxAttempts, int(l.reasoningTimeout.Seconds()))
+				_ = l.out.Log("error", "llm: "+timeoutMsg)
+				_ = l.out.Done(turnID)
+				fmt.Fprintf(os.Stderr, "%s\n", timeoutMsg)
+				return fmt.Errorf("%s", timeoutMsg)
+			}
+			// llm.Client already retries on transport/5xx/429 with
+			// exponential backoff; an error here is the upstream's
+			// last word. Surface it on stdout (visible in the audit
+			// log) AND on stderr (caught by runner's exit-code path)
+			// so the session ends 'failed', not 'succeeded'.
+			_ = l.out.Log("error", fmt.Sprintf("llm: %s", callErr))
+			_ = l.out.Done(turnID)
+			fmt.Fprintf(os.Stderr, "llm call failed after retries: %s\n", callErr)
+			return fmt.Errorf("llm call failed: %w", callErr)
+		}
+
+		// Preserve `reasoning` blocks if the upstream emitted any. Some
+		// providers (DeepSeek-Reasoner, OpenAI o-series) reject the next
+		// turn if the prior reasoning_content was elided from history.
+		if resp.Reasoning != "" || resp.ReasoningSignature != "" {
+			cctx.AppendAssistantWithReasoning(resp.Content, resp.Reasoning, resp.ReasoningSignature, resp.ToolCalls)
+		} else {
+			cctx.AppendAssistant(resp.Content, resp.ToolCalls)
+		}
+		_ = l.out.Message("assistant", resp.Content, llmToProtoToolCalls(resp.ToolCalls))
+		l.lastInputTokens = resp.Usage.InputTokens
+
+		// Empty-response guard. Some upstreams (OpenAI Response API on
+		// reasoning models in particular) return a 2xx body with
+		// `output:null` or `output:[]` — typically a few rounds into a
+		// session, with status=completed and a positive non-reasoning
+		// usage.output_tokens (so the model DID produce something, the
+		// upstream just dropped it before serialising). The default
+		// "len(tool_calls)==0 → turn done" path would silently abandon
+		// the agent's task. Instead we nudge the model to continue and
+		// cap retries so a model that repeatedly produces nothing
+		// eventually fails the turn rather than burning tokens forever.
+		// The warn log carries every diagnostic the upstream gave us
+		// (status / incomplete_reason / token breakdown) so the operator
+		// can distinguish content-filter / max-tokens / pure-empty cases
+		// without grepping raw bodies.
+		if resp.Content == "" && len(resp.ToolCalls) == 0 {
+			emptyResponseRetries++
+			diag := fmt.Sprintf(
+				"status=%q incomplete=%q reasoning_tokens=%d output_tokens=%d input_tokens=%d",
+				resp.Status, resp.IncompleteReason,
+				resp.Usage.ReasoningTokens, resp.Usage.OutputTokens, resp.Usage.InputTokens,
+			)
+			const maxEmptyResponseRetries = 3
+			if emptyResponseRetries > maxEmptyResponseRetries {
+				_ = l.out.Log("error", fmt.Sprintf("llm: empty response %d times in a row, giving up turn (%s)", emptyResponseRetries, diag))
+				_ = l.out.Done(turnID)
+				return fmt.Errorf("llm: empty response %d times in a row (%s)", emptyResponseRetries, diag)
+			}
+			_ = l.out.Log("warn", fmt.Sprintf("llm: empty response (%s); nudging continue (attempt %d/%d)", diag, emptyResponseRetries, maxEmptyResponseRetries))
+			cctx.AppendUser("<system_reminder>Your previous turn returned no assistant message and no tool calls. If you intended to stop, emit a brief closing assistant message explaining why. Otherwise, continue your work — call the appropriate tool to make progress.</system_reminder>")
+			continue
+		}
+		emptyResponseRetries = 0
+
+		// Plain assistant text containing `@` is almost always a model
+		// mistake — @agent-<role-key> mentions only wake other roles when
+		// posted through the issue_comment tool. Inject a one-shot
+		// reminder and force another round so the model can retry via
+		// the tool. Fires at most once per turn (see atMentionNudged
+		// docstring above) so a model that ignores us doesn't wedge the
+		// loop in an infinite re-prompt.
+		//
+		// CRITICAL: when the assistant message also carries tool_calls,
+		// the reminder must NOT be appended between the assistant entry
+		// and its tool results — upstream rejects an assistant(tool_calls)
+		// item whose results are not the immediately-following messages.
+		// Defer the nudge to after the tool-dispatch loop in that case.
+		shouldNudgeAtMention := !atMentionNudged && strings.ContainsRune(resp.Content, '@')
+		nudgedAtMentionThisRound := false
+		if shouldNudgeAtMention && len(resp.ToolCalls) == 0 {
+			cctx.AppendUser(atMentionReminder)
+			atMentionNudged = true
+			nudgedAtMentionThisRound = true
+		}
+
+		// Future-tense action narration guard. Mirrors the at-mention
+		// nudge shape: fires only when the assistant turn has ZERO tool
+		// calls AND the text reads like a forward-action commitment
+		// ("I'll continue …" / "继续中…" / "next I'll …"). baseline.md
+		// forbids this pattern, but reasoning models still slip into it
+		// occasionally — without the guard, the runtime's "no tool call =
+		// task done, go idle" branch silently abandons whatever the model
+		// promised. Fires at most once per turn (futureTenseNudged) so a
+		// model that keeps narrating doesn't wedge us forever.
+		shouldNudgeFutureTense := !futureTenseNudged && containsFutureTenseAction(resp.Content)
+		nudgedFutureTenseThisRound := false
+		if shouldNudgeFutureTense && len(resp.ToolCalls) == 0 {
+			_ = l.out.Log("warn", "llm: assistant text promises forward action but emits no tool call; nudging")
+			cctx.AppendUser(futureTenseReminder)
+			futureTenseNudged = true
+			nudgedFutureTenseThisRound = true
+		}
+
+		if len(resp.ToolCalls) == 0 {
+			// New user-side input arrived during the call (folded event
+			// or background-task notification), or we just injected an
+			// at-mention reminder or future-tense reminder. Give the LLM
+			// another pass with the new input visible before closing the
+			// turn.
+			if postCallLen > preCallLen || nudgedAtMentionThisRound || nudgedFutureTenseThisRound {
+				continue
+			}
+			_ = l.out.Done(turnID)
+			return nil
+		}
+
+		// Async-tool batch gate: sleep and ask_question are async tools
+		// that return immediately with "scheduled" — the LLM must NOT
+		// batch them with other calls because executing those calls
+		// alongside them would effectively bypass the wait. If either is
+		// present in this batch, only execute the async tool(s) and
+		// reject the rest with an error telling the LLM to re-issue after
+		// the wake-up notification.
+		if hasSleepCall(resp.ToolCalls) || hasAskQuestionCall(resp.ToolCalls) {
+			asyncName := asyncToolNameInBatch(resp.ToolCalls)
+			for _, call := range resp.ToolCalls {
+				_ = l.out.Status("tool")
+				args := json.RawMessage(call.Arguments)
+				var result tools.CallResult
+				if call.Name == local.SleepToolName || call.Name == platform.AskQuestionToolName {
+					result = l.registry.Call(ctx, call.Name, args)
+				} else {
+					errBody, _ := json.Marshal(map[string]any{
+						"error": fmt.Sprintf("This tool call was batched with %s in the same response. %s must be the only call in its batch — re-issue this call in a subsequent turn after the wake-up notification.", asyncName, asyncName),
+					})
+					result = tools.CallResult{
+						Source:     tools.SourceLocal,
+						ResultJSON: errBody,
+						IsError:    true,
+						ErrMsg:     fmt.Sprintf("batched with %s; re-issue after wake-up", asyncName),
+					}
+				}
+				toolContent := toolPayload(result)
+				cctx.AppendToolResult(call.ID, toolContent)
+				_ = l.out.ToolCall(call.ID, call.Name, args, json.RawMessage(toolContent))
+			}
+			// Deferred @-mention nudge: tool results are now in place, so the
+			// assistant(tool_calls) → tool(result)+ chain is intact and it's
+			// safe to append the reminder as the next user-role message.
+			if shouldNudgeAtMention {
+				cctx.AppendUser(atMentionReminder)
+				atMentionNudged = true
+			}
+			// ask_question: give the LLM another round to react to the
+			// result (see that the questionnaire was created and then
+			// end the turn naturally). sleep: park immediately — no
+			// reaction round needed.
+			if hasAskQuestionCall(resp.ToolCalls) {
+				continue
+			}
+			_ = l.out.Done(turnID)
+			return nil
+		}
+
+		// pendingSummary defers the AppendSummary call until every tool
+		// result in this round has been placed. Snapshot anchors on the
+		// most recent KindSummary entry, so placing the summary marker
+		// LAST in the round guarantees the next LLM window never starts
+		// with an orphan tool message — even if the LLM (against the
+		// tool's instruction) batched compact_session with another call.
+		var pendingSummary string
+		for _, call := range resp.ToolCalls {
+			_ = l.out.Status("tool")
+			args := json.RawMessage(call.Arguments)
+			var result tools.CallResult
+			if call.Name == local.CompactSessionToolName {
+				summary, sresult := dispatchCompactSession(args)
+				result = sresult
+				if summary != "" {
+					pendingSummary = summary
+				}
+			} else {
+				result = l.registry.Call(ctx, call.Name, args)
+			}
+			toolContent := toolPayload(result)
+			cctx.AppendToolResult(call.ID, toolContent)
+			_ = l.out.ToolCall(call.ID, call.Name, args, json.RawMessage(toolContent))
+		}
+		if pendingSummary != "" {
+			cctx.AppendSummary(pendingSummary)
+			// Disarm the compact-threshold nudge — the LLM just did
+			// the thing we were asking for. lastInputTokens stays as
+			// the pre-compact reading; the next LLM round will
+			// overwrite it with the post-compact (much smaller) prompt
+			// size and the nudge can re-arm naturally if growth resumes.
+			l.compactNudged = false
+			_ = l.out.Log("info", "compact_session: session memory compacted")
+		}
+		// Deferred @-mention nudge: tool results are now in place, so the
+		// assistant(tool_calls) → tool(result)+ chain is intact and it's
+		// safe to append the reminder as the next user-role message.
+		if shouldNudgeAtMention {
+			cctx.AppendUser(atMentionReminder)
+			atMentionNudged = true
+		}
+	}
+
+	_ = l.out.Log("warn", fmt.Sprintf("max tool rounds (%d) exhausted", l.maxToolRounds))
+	_ = l.out.Done(turnID)
+	return nil
+}
+
+// drainPending consumes whatever is already buffered on the inbox
+// without blocking, routing each item via applyInboxItem.
+func (l *Loop) drainPending(cctx *Context, inbox <-chan inboxItem, pendingItems *[]inboxItem) {
+	for {
+		select {
+		case item, ok := <-inbox:
+			if !ok {
+				return
+			}
+			l.applyInboxItem(cctx, item, pendingItems)
+		default:
+			return
+		}
+	}
+}
+
+// applyInboxItem routes a single inbox item. Events and notifications
+// are folded directly into the LLM context so they are visible on the
+// next round of the current turn — this is the seam that lets a new
+// event piggy-back into an in-progress tool-call loop instead of waiting
+// for the loop to finish. Control frames and reader errors have outer-loop
+// semantics (state reset, lifecycle, EOF propagation) that don't compose
+// with the middle of a turn, so they defer.
+func (l *Loop) applyInboxItem(cctx *Context, item inboxItem, pendingItems *[]inboxItem) {
+	switch {
+	case item.ReaderErr != nil:
+		// Stream pump failure — defer for the outer loop so the EOF /
+		// error lands in the same place as any other reader error.
+		*pendingItems = append(*pendingItems, item)
+	case item.Frame != nil:
+		if event, ok := item.Frame.GetBody().(*agentv1.StreamInputsResponse_Event); ok {
+			if l.suspended {
+				// Defer event while suspended — it will be replayed
+				// through the outer loop after resume.
+				*pendingItems = append(*pendingItems, item)
+				return
+			}
+			// Resolve the effective event kind — same logic as
+			// handleEvent so mid-turn questionnaire events are
+			// recognised and the timeout schedule is cancelled.
+			eventKind := event.Event.GetEvent()
+			payload := json.RawMessage(event.Event.GetPayload())
+			if qk := questionnaireEventKind(payload); qk != "" {
+				l.cancelQuestionnaireSchedule(payload)
+				eventKind = qk
+			}
+
+			msg, err := renderEventMessage(eventKind, payload)
+			if err != nil {
+				// Malformed payload from the server; log and drop. We
+				// don't defer it to the outer loop because that path
+				// also calls renderEventMessage and would just produce
+				// the same error.
+				_ = l.out.Log("error", fmt.Sprintf("render event mid-turn: %s", err))
+				return
+			}
+			cctx.AppendUser(msg)
+			return
+		}
+		// control / unknown body — defer to the outer loop.
+		*pendingItems = append(*pendingItems, item)
+	case item.Notification != "":
+		if l.suspended {
+			// Drop notification while suspended; the agent is paused
+			// and should not react mid-turn.
+			_ = l.out.Log("debug", fmt.Sprintf("dropped notification while suspended: %s", item.Notification))
+			return
+		}
+		// Background task finished. Append to the context so it's
+		// visible on the next round; the in-flight call (if any) is
+		// not cancelled — we don't want to waste tokens.
+		cctx.AppendUser(item.Notification)
+	}
+}
+
+// pumpFrames reads streamed frames from the transport and forwards
+// each one into the inbox. Exits on io.EOF / transport error / ctx
+// cancel; reports the reason via ReaderErr so the main loop can
+// decide whether to treat it as a clean exit (EOF) or a failure.
+func (l *Loop) pumpFrames(ctx context.Context, inbox chan<- inboxItem) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		frame, err := l.in.StreamFrame(ctx)
+		if err != nil {
+			select {
+			case inbox <- inboxItem{ReaderErr: err}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		select {
+		case inbox <- inboxItem{Frame: frame}:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+type llmResult struct {
+	resp *llm.CreateResponse
+	err  error
+}
+
+// renderEventMessage formats the inbound event into a single
+// user-role message. JSON wrapping is intentional: the LLM is good at
+// seeing structured data in the conversation and prompts that name a
+// specific event tend to invoke role-appropriate behaviour reliably.
+func renderEventMessage(event string, payload json.RawMessage) (string, error) {
+	payloadStr := "{}"
+	if len(payload) > 0 {
+		var p any
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return "", err
+		}
+		compact, err := json.Marshal(p)
+		if err != nil {
+			return "", err
+		}
+		var buf strings.Builder
+		xml.EscapeText(&buf, compact)
+		payloadStr = buf.String()
+	}
+	return fmt.Sprintf(
+		`<hangrix-event kind="platform.%s"><payload>%s</payload></hangrix-event>`,
+		event, payloadStr,
+	), nil
+}
+
+func toolPayload(r tools.CallResult) string {
+	if r.IsError {
+		// When the error carries a structured ResultJSON (platform
+		// soft-errors like `{is_error,status,error}`), surface it
+		// verbatim so the LLM sees the full detail. Fall back to a
+		// simple {error: ErrMsg} for Go-level errors (transport
+		// failures, unknown tools) where ResultJSON is nil.
+		if len(r.ResultJSON) > 0 {
+			return string(r.ResultJSON)
+		}
+		out, _ := json.Marshal(map[string]any{"error": r.ErrMsg})
+		return string(out)
+	}
+	if len(r.ResultJSON) == 0 {
+		return "null"
+	}
+	return string(r.ResultJSON)
+}
+
+// llmToProtoToolCalls converts the llm package's ToolCall slice into
+// the proto wire shape the sink expects. Both carry the same
+// (id,name,arguments) triple — this is purely a type translation at
+// the LLM-↔-sink boundary.
+func llmToProtoToolCalls(in []llm.ToolCall) []*agentv1.ToolCall {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*agentv1.ToolCall, len(in))
+	for i, c := range in {
+		out[i] = &agentv1.ToolCall{Id: c.ID, Name: c.Name, Arguments: c.Arguments}
+	}
+	return out
+}
+
+func historyToMessages(items []*agentv1.HistoryItem) []llm.Message {
+	out := make([]llm.Message, 0, len(items))
+	for _, it := range items {
+		msg := llm.Message{Role: it.GetRole(), Content: it.GetContent(), ToolCallID: it.GetToolCallId()}
+		if calls := it.GetToolCalls(); len(calls) > 0 {
+			msg.ToolCalls = make([]llm.ToolCall, len(calls))
+			for i, c := range calls {
+				msg.ToolCalls[i] = llm.ToolCall{ID: c.GetId(), Name: c.GetName(), Arguments: c.GetArguments()}
+			}
+		}
+		// Round-trip the summary marker so that on a runner re-attach
+		// (second history frame) Snapshot still anchors on the latest
+		// compact point. Event-kind items keep their raw payload as
+		// content; we leave Kind empty for them because the LLM has
+		// already seen that shape and the window logic does not care.
+		if it.GetKind() == llm.KindSummary {
+			msg.Kind = llm.KindSummary
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
+// trimTrailingDanglingToolCalls drops any trailing assistant messages that
+// carry tool_calls but have no corresponding tool messages after them. A
+// dangling tool_use block causes upstream LLM APIs (Anthropic, OpenAI) to
+// reject the request with a 400 — "tool_use ids were found without
+// tool_result blocks immediately after". This can happen when the agent
+// container crashed mid-turn in a previous wake: the assistant(tool_calls=…)
+// message was persisted, but the tool-result messages never were.
+//
+// The algorithm scans from the end, collecting tool-call IDs seen in tool
+// messages. Each trailing assistant message with tool_calls is checked:
+// if any of its call IDs are not accounted for, the message is dropped and
+// we continue scanning. The first message that is NOT a dangling assistant
+// stops the trim.
+//
+// Safe on empty and well-formed slices — does nothing when no dangling
+// messages exist.
+func trimTrailingDanglingToolCalls(msgs []llm.Message) []llm.Message {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	// Build the set of tool-call IDs referenced by tool messages so we can
+	// tell which assistant(tool_calls) entries are already satisfied.
+	seenToolIDs := make(map[string]bool, len(msgs))
+	for _, m := range msgs {
+		if m.Role == "tool" && m.ToolCallID != "" {
+			seenToolIDs[m.ToolCallID] = true
+		}
+	}
+	// Scan backwards from the last message, dropping any assistant message
+	// whose tool_calls are not all accounted for.
+	cut := len(msgs)
+	for cut > 0 {
+		m := msgs[cut-1]
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			// Found a non-assistant or assistant-without-tool_calls message;
+			// the trailing run (if any) is clean above this point.
+			break
+		}
+		// Check whether all of this assistant's tool-call IDs appear in a
+		// tool message somewhere in the remaining slice.
+		dangling := false
+		for _, tc := range m.ToolCalls {
+			if !seenToolIDs[tc.ID] {
+				dangling = true
+				break
+			}
+		}
+		if !dangling {
+			// All tool_calls accounted for; the assistant entry is fine and
+			// everything above it is considered valid by transitivity.
+			break
+		}
+		// This assistant message has at least one tool_call that never
+		// received a tool_result — drop it and continue upward.
+		cut--
+	}
+	return msgs[:cut]
+}
+
+// maybeNudgeCompact injects a one-shot reminder telling the LLM to call
+// compact_session at its next safe boundary, once the input-token
+// usage of the previous turn crossed CompactTokenThreshold. The
+// reminder is appended as a user-role message so it lands in the
+// LLM's view on the upcoming round; we don't try to truncate, summarise
+// for the LLM, or stop the in-flight task — the model is the only thing
+// that knows when a clean cutover point is reached.
+//
+// Re-arms after the LLM actually compacts (cleared in the
+// pendingSummary branch of the dispatch loop). Disabled when
+// compactTokenThreshold is zero.
+func (l *Loop) maybeNudgeCompact(cctx *Context) {
+	if l.compactTokenThreshold <= 0 || l.compactNudged {
+		return
+	}
+	if l.lastInputTokens < l.compactTokenThreshold {
+		return
+	}
+	cctx.AppendUser(fmt.Sprintf(
+		"<system_reminder>Context usage has reached %d input tokens (threshold %d). When you can stop at a clean step — typically after a tool result settles and before starting the next sub-task — call the compact_session tool with a thorough summary so subsequent turns can keep working without hitting the upstream's context window. Continue the current step if you're mid-flight; do NOT abandon work to compact immediately.</system_reminder>",
+		l.lastInputTokens, l.compactTokenThreshold,
+	))
+	l.compactNudged = true
+}
+
+// dispatchCompactSession is the loop-side handler for the compact_session
+// tool call. The tool itself is schema-only; we parse the args here and
+// surface the trimmed summary back to the caller, which is responsible
+// for placing the AppendSummary marker after every tool result in the
+// round has been emitted (see the pendingSummary commentary).
+//
+// Bad-args paths are converted into IsError CallResults rather than Go
+// errors because the LLM is the audience: a structured tool result lets
+// it self-correct (rewrite a non-empty summary, retry) on the next round
+// without us having to thread a separate error channel through the loop.
+func dispatchCompactSession(args json.RawMessage) (string, tools.CallResult) {
+	summary, err := local.ParseCompactSessionArgs(args)
+	if err != nil {
+		errBody, _ := json.Marshal(map[string]any{"error": err.Error()})
+		return "", tools.CallResult{
+			Source:     tools.SourceLocal,
+			ResultJSON: errBody,
+			IsError:    true,
+			ErrMsg:     err.Error(),
+		}
+	}
+	okBody, _ := json.Marshal(map[string]any{
+		"ok":        true,
+		"compacted": true,
+		"note":      "Prior conversation has been replaced with your summary. Subsequent turns will see {system prompt} + this summary + anything new — proceed with the task using only what your summary preserved.",
+	})
+	return summary, tools.CallResult{Source: tools.SourceLocal, ResultJSON: okBody}
+}
+
+// hasSleepCall reports whether any tool call in the slice is a sleep call.
+func hasSleepCall(calls []llm.ToolCall) bool {
+	for _, c := range calls {
+		if c.Name == local.SleepToolName {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAskQuestionCall reports whether any tool call in the slice is an
+// ask_question call. Used by the async-tool batch gate (same pattern as
+// hasSleepCall).
+func hasAskQuestionCall(calls []llm.ToolCall) bool {
+	for _, c := range calls {
+		if c.Name == platform.AskQuestionToolName {
+			return true
+		}
+	}
+	return false
+}
+
+// asyncToolNameInBatch returns the name of the async tool (sleep or
+// ask_question) that triggered the batch gate. Used to build a
+// correct error message for the rejected tool calls.
+func asyncToolNameInBatch(calls []llm.ToolCall) string {
+	if hasSleepCall(calls) {
+		return local.SleepToolName
+	}
+	return platform.AskQuestionToolName
+}
+
+// questionnaireEventKind reads the cause_kind from an event payload and
+// returns the corresponding event name when the payload represents a
+// questionnaire lifecycle event (answered or closed). Returns ""
+// when the event is not questionnaire-related or the payload can't be
+// parsed. The server sends these as issue.comment events with the
+// cause_kind embedded in the payload — this helper bridges the gap so
+// the agent can recognise and render them correctly.
+func questionnaireEventKind(payload json.RawMessage) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var evt struct {
+		CauseKind string `json:"cause_kind"`
+	}
+	if err := json.Unmarshal(payload, &evt); err != nil {
+		return ""
+	}
+	switch evt.CauseKind {
+	case "questionnaire_answered":
+		return "questionnaire.answered"
+	case "questionnaire_closed":
+		return "questionnaire.closed"
+	}
+	return ""
+}
+
+// cancelQuestionnaireSchedule parses a questionnaire event payload and
+// cancels the pending timeout schedule if one exists. Safe to call on a
+// nil async or a non-existent schedule (no-op). The schedule ID follows
+// the convention "questionnaire-{id}".
+func (l *Loop) cancelQuestionnaireSchedule(payload json.RawMessage) {
+	if l.async == nil || len(payload) == 0 {
+		return
+	}
+	var evt struct {
+		QuestionnaireID *int64 `json:"questionnaire_id"`
+	}
+	if err := json.Unmarshal(payload, &evt); err != nil || evt.QuestionnaireID == nil {
+		return
+	}
+	l.async.CancelSchedule(fmt.Sprintf("questionnaire-%d", *evt.QuestionnaireID))
+}
+
+func newTurnID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return "turn_" + hex.EncodeToString(b[:])
+}

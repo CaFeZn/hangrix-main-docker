@@ -1,0 +1,330 @@
+# Hangrix 仓库初始化参考
+
+> 这是一份面向 code agent 的操作参考。当你被要求初始化一个 Hangrix 仓库时，
+> 先 webfetch 读取本文件，再按项目目标生成最小可用的配置与初始代码。
+> 完整规范见仓库内 docs/ 目录。
+
+
+>
+> 编辑器 Schema 校验：本仓库的 agents.yml JSON Schema 可通过
+> 与此文件同源的 `/agents.schema.json` 获取（即你获取本文件的地址
+> 把末尾文件名换成 `agents.schema.json`）。在 VS Code / JetBrains 等
+> 编辑器里把这个 URL 绑定到 `.hangrix/agents.yml`（VS Code: settings
+> `yaml.schemas`；JetBrains: Languages & Frameworks → Schemas and DTDs →
+> JSON Schema Mappings）即可获得字段自动补全、枚举提示和实时校验。
+---
+
+## 1. 最小目录约定
+
+初始化 Hangrix 仓库需要在仓库根目录创建以下文件/目录：
+
+```
+host-repo/
+├── .hangrix/
+│   ├── agents.yml                   # 必须：team 级共享配置
+│   └── agents/
+│       ├── maintainer.md            # 必须：至少一个 role
+│       ├── product-designer.md
+│       └── ...                      # 按需增加更多 role
+└── ...your code...
+```
+
+- **`agents.yml`** — team 级配置（容器环境、LLM 默认、review gate、工具规则）。
+- **`agents/`** — 每个 role 一个 `.md` 文件，文件名即 role key（如 `maintainer.md`）。
+  每个文件包含 YAML front matter（triggers / permission / tools 等）+ markdown 正文作为 prompt。
+- Role 配置统一放在 `.hangrix/agents/` 目录下，每个 role 一个文件。
+- `workflows/` 按需创建（CI/CD 定义）。
+
+---
+
+## 2. agents.yml 核心 schema
+
+```yaml
+version: 1           # 固定值，当前仅支持 1
+
+container:           # 所有 role 共享的运行时环境
+  # image / build 二选一
+  image: ghcr.io/acme/dev:1.2.3      # 或 build.dockerfile
+  # build:
+  #   dockerfile: .hangrix/agent.Dockerfile
+  #   context: .
+  #   args:
+  #     GO_VERSION: "1.26"
+
+  # entrypoint: [""]  # 覆盖容器 PID 1。省略 = runner 用 sleep infinity
+  env:               # 环境变量；值支持 ${VAR_NAME} 引用仓库变量/机密
+    NODE_ENV: development
+  volumes:           # repo-scope 命名缓存
+    - { name: pnpm-store, mount: /caches/pnpm }
+
+llm:                 # team 默认 LLM（可选）
+  model: claude-sonnet-4-6
+  reasoning_effort: medium
+  max_context_tokens: 200000
+  max_output_tokens: 8000
+
+tools:               # 可复用工具规则：名字 → 平台工具名 glob 白名单
+  all: ["*"]         # 全部平台工具
+  worker:            # 干活角色：读/评论/创建 issue/管自己的贡献分支
+    - issue_read
+    - issue_comment
+    - issue_create
+    - issue_edit
+    - contribution_*
+    - roster_list
+  reviewer:          # 审查者：读/评论/投票/问卷
+    - issue_read
+    - issue_comment
+    - issue_review_vote
+    - contribution_list
+    - contribution_read
+    - ask_question
+    - check_questionnaire
+    - close_questionnaire
+  designer:          # 设计师：读/评论/问卷
+    - issue_read
+    - issue_comment
+    - issue_comment_cross
+    - issue_create
+    - roster_list
+    - ask_question
+  planner:           # 架构师：读/创建/编辑 issue + 问卷
+    - issue_read
+    - issue_create
+    - issue_edit
+    - issue_todo_list
+    - issue_todo_update
+    - roster_list
+    - ask_question
+
+# Review gate：按改动路径匹配审查者
+reviewers:
+  rules:
+    - paths: ["apps/api/**", "internal/**"]
+      reviewers: [backend-reviewer, tester]
+    - paths: ["apps/frontend/**"]
+      reviewers: [frontend-reviewer, tester]
+  fallback: [maintainer]   # 未匹配任何规则的路径由 maintainer 审查
+```
+
+关键约束：
+- `container.image` 和 `container.build` 互斥，必须二选一。
+- `llm:` 支持 team 级 + per-role 两层按字段合并（role 写哪个字段覆盖哪个字段）。
+- `tools:` 规则名只能被 agent front matter 中的 `tools:` 列表引用；**本地工具（read/write/edit/glob/grep/bash/webfetch）永远可用，不受 tools 限制**。
+- 完整 JSON Schema 见 `docs/agents.schema.json`，详细参考见 `docs/agent-config.md`。
+
+---
+
+## 3. Role 文件格式（`.hangrix/agents/<role-key>.md`）
+
+
+> **JSON Schema 校验**：该文件的 YAML front matter 的字段契约定义在
+> `agents.schema.json` 的 `$defs.agentFrontMatter` 节。把
+> 此文件同源的 `/agents.schema.json` 作为编辑器的 YAML Schema
+> 绑定到 `.hangrix/agents/*.md` 文件的 front matter 区域，即可获得
+> `triggers` / `permission` / `tools` / `mcp` / `scope` / `llm` 的补全
+> 提示。注意：Markdown 正文部分（front matter 之后）就是 role 的
+> system prompt，不参与 schema 校验，必须非空。
+每个 role 是一个 markdown 文件，YAML front matter + 正文 prompt：
+
+```markdown
+---
+triggers:
+  issue.comment:
+    mentioned_only: true          # 只在被 @agent-<key> 提及时唤醒
+  # issue.opened: {}              # 监听新 issue
+  # review_vote.posted: {}        # 监听审查投票
+scope:
+  paths: ["apps/api/**", "internal/**"]
+permission: write                 # read / write；省略默认 read
+tools: [worker]                   # 引用 agents.yml 的 tools 规则
+mcp: [playwright]                 # 可选：MCP 服务器白名单
+llm:                              # 可选：per-role 覆盖 team LLM 配置
+  model: claude-opus-4-7
+  reasoning_effort: high
+---
+你在此编写该 role 的 system prompt。
+正文在 front matter 之后，markdown 格式。
+```
+
+### 字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `triggers` | Map | 事件订阅。`issue.opened: {}` / `issue.comment: { mentioned_only: true }` / `commit.pushed: { paths: [...] }` / `review_vote.posted: {}` / `patch.submitted: {}` / `ci.status_changed: {}` |
+| `scope.paths` | `[]string` | 软约束：告知 dispatcher 该 role 负责的路径范围 |
+| `permission` | `read | write` | 服务端强制。`read` 只放行只读端点；`write` 放行全部写操作 |
+| `tools` | `[]string` | 引用 agents.yml 的 `tools:` 规则名。角色能看到的平台工具 = 所引规则 glob 并集 |
+| `mcp` | `[]string` | MCP 服务器白名单，对应 `.mcp.json` 中的 key |
+| `llm` | Map | 覆盖 team 级 LLM 配置（按字段合并） |
+| prompt（正文） | Markdown | front matter 之后的全部内容就是该 role 的 system prompt。不可为空 |
+
+---
+
+## 4. 常见角色模式
+
+### 4.1 单体/通用代码仓库
+
+agents/ 目录下文件：
+
+```
+agents/
+├── maintainer.md       # issue.opened + issue.comment 调度，write 权限
+├── product-designer.md # issue.comment mentioned_only，designer 工具
+├── tester.md           # 测试角色，read 权限
+├── developer.md        # 开发角色，worker 工具
+└── developer-reviewer.md  # 代码审查，reviewer 工具
+```
+
+### 4.2 Web 应用
+
+```
+agents/
+├── maintainer.md
+├── product-designer.md
+├── tester.md
+├── backend.md
+├── backend-reviewer.md
+├── frontend.md
+└── frontend-reviewer.md
+```
+
+### 4.3 文档/内容仓库
+
+```
+agents/
+├── maintainer.md
+├── product-designer.md
+├── tester.md
+├── writer.md
+└── writer-reviewer.md
+```
+
+提示：具体 prompt 内容按项目需求编写；`maintainer` 通常监听 `issue.opened` 做调度，
+其余 role 在需要时被 `@agent-<role-key>` 唤醒。
+
+---
+
+## 5. 容器选择原则
+
+- **优先选已有工具链的镜像**：如 `node:22-alpine`、`golang:1.26`、`python:3.13-slim`。
+  这些镜像自带包管理器和常用工具，无需额外安装。
+- **需要持久依赖时写独立的 agent Dockerfile**：如果 roles 需要 apt/pnpm/cargo
+  等工具且基础镜像里没有，**为 agent 单独编写** `.hangrix/agent.Dockerfile`，
+  在 `container.build.dockerfile` 引用它。
+  - **不要复用 `.devcontainer/Dockerfile`**：devcontainer 面向人类开发者（包含
+    IDE 工具、shell 配置、调试器等），agent 容器只需"能跑构建/测试"的最小工具集。
+    两者目标不同，复用会让 agent 容器膨胀、冷启动变慢、攻击面变大。两份 Dockerfile
+    保持完全独立。
+  - **最小骨架**（示例：Go + Node 双栈 agent）：
+
+    ```dockerfile
+    # .hangrix/agent.Dockerfile
+    FROM golang:1.26-bookworm
+
+    # 装入 roles 实际需要的工具，且仅装这些。
+    RUN apt-get update && apt-get install -y --no-install-recommends \
+          git ca-certificates curl \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Node + pnpm（如果 web role 需要）
+    RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+        && apt-get install -y nodejs \
+        && corepack enable && corepack prepare pnpm@latest --activate
+
+    # agent 运行时不需要 ENTRYPOINT —— 留给 .hangrix/agents.yml 的
+    # container.entrypoint 决定（省略即用 runner 默认的 sleep infinity）。
+    WORKDIR /workspace
+    ```
+
+  - **在 agents.yml 中引用**：
+
+    ```yaml
+    container:
+      build:
+        dockerfile: .hangrix/agent.Dockerfile
+        context: .            # 默认就是仓库根，可省
+      env:
+        NODE_ENV: development
+      volumes:
+        - { name: pnpm-store, mount: /caches/pnpm }
+    ```
+
+  - **不要在 agent 运行时临时安装**：容器每次 session 从镜像启动，`apt-get install`
+    不会持久化到下次 session（详见第 7 节）。
+- **entrypoint 不填时默认行为**：runner 用 `/usr/bin/sleep infinity` 让容器成为被动 sandbox，
+  所有操作通过 `docker exec` 执行（`bash` 工具）。如果镜像自带 supervisor（如 s6-overlay），
+  设置 `entrypoint: ["/init"]` 让其接管 PID 1。
+- **volumes 缓存加速**：为包管理器配置命名缓存（pnpm-store、go-mod、pip-cache 等），
+  避免每次 session 重新下载依赖。
+
+---
+
+## 6. 初始化任务建议
+
+按以下顺序执行初始化，从小到大逐步验证：
+
+1. **补 README.md**：至少包含项目名和一句话描述。
+2. **补 .gitignore**：按语言/框架标准模板（node_modules/、__pycache__/、*.exe 等）。
+3. **补包清单**：package.json / go.mod / requirements.txt / Cargo.toml 等，锁定语言与版本。
+4. **补最小可运行入口**：一个能 `run` / `start` / `build` 的最小代码入口（单文件即可）。
+5. **补 agents.yml**：team 级配置（container + llm + tools + reviewers）。
+6. **补 agents/maintainer.md**：先只配 maintainer（`issue.opened` + `issue.comment`），
+   跑通一个 issue 闭环后再扩展更多 role。
+7. **补 agents/*.md**：按需增加 product-designer、tester、developer 等 role。
+8. **补 workflows/*.yml**：在 CI/CD 需求明确后按 `docs/workflow-system.md` 创建。
+
+---
+
+## 7. 避免事项
+
+- **不要生成过多 role**：3–5 个通常足够；每增加一个 role 就是多一个需要维护的 prompt 和触发条件。
+- **不要在 agents.yml 内联 role 定义**：role 配置统一写到 `.hangrix/agents/<role-key>.md` 中。
+  `agents.yml` 只放 team 级配置（container / llm / tools / reviewers）。
+- **不要假设运行时临时安装可持久化**：容器每次 session 从镜像启动，apt-get/pip install 不会保留。
+  需要持久依赖就写 Dockerfile。
+- **不要忽略 `permission` 边界**：`read` 只放行只读端点；`write` 放行所有写操作。
+  按最小权限原则声明 `permission`。
+- **不要使用中文 role key**：role key 只允许 `[a-z][a-z0-9-]*`，提示词内容用中文没问题。
+- **不要忘记 `.hangrix/` 目录本身就是 git 追踪的**：你的配置和 prompt 会随代码一起版本控制。
+
+---
+
+## 8. 贡献分支模型（进阶）
+
+Hangrix 使用基于分支的贡献模型（contribution branches）：
+
+- **分支命名**：每个 role 向 `issue-<N>/<role>/<slug>` 推送（如 `issue-42/backend/add-login`）。
+- **不可变分支**：一旦推送不可改写。需要修订时推送新版本 slug（如 `add-login-v2`）。
+- **Review gate**：`reviewers:` 规则按改动路径匹配审查者；所有必需审查者投票 approve 后分支才能合并。
+- **合并流程**：maintainer 使用 `contribution_apply` 将已审批的分支合入 issue 分支；
+  所有工作完成后 `issue_merge` 将 issue 分支合入 base。
+
+完整规范见 `docs/contribution-branches.md`。
+
+---
+
+## 9. Mention 协议
+
+- 语法：`@agent-<role-key>`（如 `@agent-backend`）。
+- 支持在 issue 评论中通过此语法唤醒任意 role。
+- 同评论 @ 多个 role 会分别唤醒各自的 agent session。
+- 人类和 agent 使用同一协议：没有第二种唤醒方式。
+
+
+---
+
+## 10. Workflow 配置（可选）
+
+`.hangrix/workflows/*.yml` 是仓库的 CI/CD 触发器，类 GitHub Actions 但与
+agent session 完全解耦。详细规范见仓库内 `docs/workflow-system.md`。
+
+关键约束：
+- `version: 1` 必填；`name` 仓库内唯一，约束 `[a-z][a-z0-9-]*`。
+- 支持 5 类事件：`repo.push` / `repo.push_tag` / `issue.opened` /
+  `issue.comment` / `workflow.dispatch`。
+- 容器环境**继承自** `.hangrix/agents.yml` 的 `container` —— workflow 文件
+  不可单独声明 `image` / `build` / `volumes`。这是单一容器来源原则。
+- 编辑器 Schema 校验：独立 schema → 与此文件同源的 `/workflows.schema.json`
+
+缺少 `.hangrix/agents.yml` 时 workflow 系统视为不可用，因为缺少唯一容器定义。

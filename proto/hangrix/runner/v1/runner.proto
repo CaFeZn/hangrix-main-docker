@@ -1,0 +1,462 @@
+// hangrix.runner.v1 is the wire contract the standalone `hangrix-runner`
+// binary speaks with the platform. Replaces the ad-hoc JSON-over-HTTP
+// `/api/runner/*` and `/api/runner/workflow-jobs/{id}/*` surface that
+// lived in runner/handler/agent.go + workflow/handler/handler.go.
+//
+// Design notes:
+//
+//   - Each RPC has dedicated Request / Response messages (buf lint
+//     STANDARD requirement). Empty responses are explicit messages so
+//     future fields can be added without a service version bump.
+//
+//   - Tasks long-poll. Tasks() is unary with long-poll semantics: the
+//     server blocks up to ~20s and returns either a populated Task or
+//     an empty response (the 204 equivalent). The runner re-calls in a
+//     loop. Server-streaming would push subsequent tasks before the
+//     runner is ready to claim them; that's worse, not better, because
+//     the runner processes one task at a time.
+//
+//   - JSON payload escape hatches. EnrollRequest.capabilities and
+//     HeartbeatRequest.capabilities stay as `bytes` carrying raw JSON.
+//     The platform never introspects this blob — it round-trips it
+//     verbatim into runners.capabilities. Wrapping it in
+//     google.protobuf.Struct would force a re-marshal every hop for no
+//     gain.
+//
+//   - Token + auth. Enroll consumes a one-shot enroll token (`hgxe_`);
+//     every other RPC carries the long-lived agent token (`hgxr_`) as
+//     the bearer credential. The handler-side interceptor enforces this
+//     split; the wire shape is identical otherwise.
+//
+//   - Binary downloads stay HTTP. `GET /api/runner/binaries/{name}`,
+//     `GET /install/runner.sh`, and `GET /install/{asset}` are
+//     plain-byte file serving — Connect would force a base64 round-trip
+//     for the install-script `curl|sh` entrypoint, which is the whole
+//     point of having that route. BootstrapPayload.binaries still
+//     names them; they just don't go through this proto surface.
+syntax = "proto3";
+
+package hangrix.runner.v1;
+
+// ---- Shared value types ------------------------------------------------
+
+// BinaryInfo is the per-platform metadata block embedded in
+// BootstrapPayload.binaries. `url` is server-relative; the runner
+// prepends whichever base URL it already trusts.
+message BinaryInfo {
+  string url = 1;
+  string name = 2;
+  string goos = 3;
+  string goarch = 4;
+  string sha256 = 5;
+  int64 size = 6;
+}
+
+// BootstrapPayload is what the runner needs after enrollment so it can
+// persist a complete state file and start serving with no flags. The
+// runner re-fetches this via Bootstrap() on every startup (authed with
+// the agent token) so an operator who rotates endpoints / image
+// defaults doesn't have to touch the runner.
+message BootstrapPayload {
+  // Binaries is the catalogue of `hangrix-runner` artefacts embedded
+  // in this server build, keyed by AssetName
+  // (`hangrix-runner_<goos>_<goarch>`). Used by the runner's
+  // self-update path to look up its own entry by GOOS/GOARCH.
+  map<string, BinaryInfo> binaries = 1;
+  // BaseURL is the single platform base the in-container agent uses
+  // to reach every backend route — LLM proxy + platform REST API.
+  string base_url = 2;
+  // DefaultAgentImage is what the runner falls back to when a session
+  // arrives with no image override. The real session-spawn path drives
+  // this per-role from the host repo's `.hangrix/agents.yml`.
+  string default_agent_image = 3;
+  // Cadence the runner should match. Mirrors the server-side pollWait
+  // constant minus a small safety margin.
+  int32 poll_wait_sec = 4;
+  int32 heartbeat_sec = 5;
+}
+
+// BuildSpec mirrors agentsconfig.Build on the wire. Empty / absent
+// means the runner pulls / uses `agent_image` as-is.
+message BuildSpec {
+  string dockerfile = 1;
+  string context = 2;
+  map<string, string> args = 3;
+}
+
+// Volume is one (name, mount) pair from agents.yml's container block.
+// The runner adds each as a `-v` bind mount at `docker create` time.
+message Volume {
+  string name = 1;
+  string mount = 2;
+}
+
+// AgentSessionTask carries the fields the runner needs to spawn an
+// in-container agent for one platform-claimed agent_sessions row.
+// Mirrors handler.taskResp's agent-session arm + client.Task's session
+// fields. Workflow-job tasks ride in WorkflowJobTask instead.
+message AgentSessionTask {
+  int64 session_id = 1;
+  // HostRepoID is the owning repo for this session. The runner uses
+  // it to namespace named volumes per-repo so caches don't collide.
+  int64 host_repo_id = 2;
+  string agent_image = 3;
+  // AgentEntrypoint overrides the container's PID 1. Empty means the
+  // orchestrator falls back to `/usr/bin/sleep infinity`.
+  repeated string agent_entrypoint = 4;
+  // AgentBuild, when set, tells the orchestrator to materialise
+  // agent_image via `docker build` before `docker create`.
+  BuildSpec agent_build = 5;
+  string role = 6;
+  string model = 7;
+  // llm_max_context_tokens (field 8) is deprecated and reserved.
+  // Agents now query the model spec via GET /api/v1/models/{name}.
+  reserved 8;
+  reserved "llm_max_context_tokens";
+  // LLMReasoningEffort / LLMThinking forward role-level LLM
+  // configuration into the container env. Empty means "not configured"
+  // — the agent applies its default.
+  string llm_reasoning_effort = 9;
+  string llm_thinking = 10;
+  // IssueNumber is the per-repo issue this session is bound to. Zero
+  // for non-issue sessions.
+  int32 issue_number = 11;
+  string working_branch = 12;
+  string base_branch = 13;
+  string host_addendum = 14;
+  map<string, string> env = 15;
+  // SessionToken is the decrypted hgxs_ plaintext. Transmitted only
+  // over the runner's authenticated channel.
+  string session_token = 16;
+  // ContainerID is the long-lived container the runner previously
+  // created for this session (empty for a fresh session or after the
+  // 7-day idle reaper cleared it).
+  string container_id = 17;
+  // RepoVariables carries the repo-level variable + decrypted secret
+  // values for ${VAR_NAME} expansion in env. The proto has no
+  // tri-state — the runner treats an empty map as "no variables", and
+  // the server upgrade gate is now stable so the legacy nil
+  // backward-compat path is gone.
+  map<string, string> repo_variables = 18;
+  repeated Volume volumes = 19;
+  // McpServers is the role's MCP server whitelist from agents.yml.
+  repeated string mcp_servers = 20;
+}
+
+// WorkflowJobTask is the task payload when a workflow_run job is
+// claimed off the queue. Mirrors handler.workflowJobDTO.
+message WorkflowJobTask {
+  int64 job_run_id = 1;
+  int64 workflow_run_id = 2;
+  int64 repo_id = 3;
+  string owner = 4;
+  string name = 5;
+  string workflow_name = 6;
+  string job_key = 7;
+  string checkout_ref = 8;
+  string commit_sha = 9;
+  // Tag is the short tag name for repo.push_tag events (ref strips the
+  // "refs/tags/" prefix). Empty for other event kinds.
+  string tag = 10;
+  string event_name = 11;
+  string event_cause_id = 12;
+  WorkflowContainer container = 13;
+  string working_directory = 14;
+  repeated WorkflowStep steps = 15;
+  int32 timeout_minutes = 16;
+  map<string, string> repo_variables = 17;
+  // Inputs carries the resolved workflow.dispatch inputs, already
+  // transformed to WORKFLOW_INPUT_<UPPER_SNAKE> keys server-side.
+  map<string, string> inputs = 18;
+  // WorkflowToken is a short-lived API token scoped to the workflow
+  // run's repo. Injected as HANGRIX_WORKFLOW_TOKEN for steps that
+  // call authenticated platform APIs (e.g. release).
+  string workflow_token = 19;
+  // TriggerActor identifies the entity that triggered this run.
+  string trigger_actor_kind = 20;
+  string trigger_actor_id = 21;
+  string trigger_actor_display_name = 22;
+}
+
+// WorkflowContainer is the resolved container definition for a
+// workflow job — agents.yml's container block merged with workflow /
+// job-level overrides.
+message WorkflowContainer {
+  string image = 1;
+  BuildSpec build = 2;
+  repeated string entrypoint = 3;
+  map<string, string> env = 4;
+  repeated Volume volumes = 5;
+}
+
+// WorkflowStep is one step in a workflow job. `type` discriminates
+// between built-in step kinds: "" / "run" (shell command), "release"
+// (create/publish a platform release), "script" (Node.js with the
+// hangrix SDK injected).
+message WorkflowStep {
+  string id = 1;
+  string name = 2;
+  // Type is empty / "run" for a shell step; "release" or "script"
+  // selects a built-in typed step.
+  string type = 3;
+  // Run is the shell command (type=="" / "run").
+  string run = 4;
+  map<string, string> env = 5;
+  // Dir overrides the job working directory for this step.
+  string dir = 6;
+  // Script is the JavaScript source (type=="script").
+  string script = 7;
+  // With carries typed-step params (e.g. release's tag/notes/assets).
+  // Raw JSON; interpreted by the runner per step type. Mirrors
+  // workflowStepDTO.With (map[string]any).
+  bytes with = 8;
+}
+
+// CleanupTask is one (session, container) pair the platform wants the
+// runner to `docker rm`. Returned by ListCleanupTasks; ACKed via
+// MarkCleanupDone.
+message CleanupTask {
+  int64 session_id = 1;
+  string container_id = 2;
+}
+
+// StopTask is one (session, container) pair the platform wants the
+// runner to `docker stop`. Distinct from CleanupTask in that the
+// container is to be stopped (graceful) rather than removed. ACKed
+// via MarkStopDone.
+message StopTask {
+  int64 session_id = 1;
+  string container_id = 2;
+}
+
+// ---- Service -----------------------------------------------------------
+
+service RunnerService {
+  // Enroll trades an `hgxe_` one-shot enroll token for a long-lived
+  // `hgxr_` agent token. The only RPC that does not require the agent
+  // token; the server-side interceptor exempts this method by name.
+  // The response embeds BootstrapPayload so a brand-new runner has
+  // everything it needs in one round trip.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // NOTE: there's deliberately no Bootstrap RPC here. The refresh-on-
+  // startup path is served by the plain-JSON `GET /api/runner/bootstrap`
+  // endpoint so the runner self-update flow can ride a stable shape
+  // across protocol changes — if Bootstrap were Connect-RPC, every
+  // future protocol bump would brick old runners' auto-update.
+
+  // Heartbeat reports the runner's recent capabilities. The server
+  // updates runners.last_seen and runners.capabilities; nothing else
+  // depends on the response shape.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Tasks long-polls for the next unit of work. Blocks up to ~20s.
+  // Response.task is unset (oneof empty) when no work was available;
+  // the runner re-calls in a loop with a small backoff.
+  rpc Tasks(TasksRequest) returns (TasksResponse);
+
+  // ListCleanupTasks returns up to 50 (session, container) pairs
+  // flagged for `docker rm`. Empty list returns a non-null `tasks`
+  // slice — a polling client treats it as a successful empty poll.
+  rpc ListCleanupTasks(ListCleanupTasksRequest) returns (ListCleanupTasksResponse);
+
+  // MarkCleanupDone ACKs that `docker rm` of one session's container
+  // succeeded (or was already gone). Scoped by runner_id server-side.
+  rpc MarkCleanupDone(MarkCleanupDoneRequest) returns (MarkCleanupDoneResponse);
+
+  // ListStopTasks / MarkStopDone are the `docker stop` (graceful) twin
+  // of the cleanup pair. Same semantics.
+  rpc ListStopTasks(ListStopTasksRequest) returns (ListStopTasksResponse);
+  rpc MarkStopDone(MarkStopDoneRequest) returns (MarkStopDoneResponse);
+
+  // ---- Workflow job callbacks ----------------------------------------
+  //
+  // The seven calls below report a workflow job's lifecycle (running →
+  // step results → terminal status) and phase lifecycle. They were
+  // previously mounted under `/api/runner/workflow-jobs/{id}/*` in the
+  // workflow module's handler.
+
+  rpc MarkWorkflowJobRunning(MarkWorkflowJobRunningRequest)
+      returns (MarkWorkflowJobRunningResponse);
+  rpc AppendWorkflowJobLog(AppendWorkflowJobLogRequest)
+      returns (AppendWorkflowJobLogResponse);
+  rpc ReportWorkflowStepResult(ReportWorkflowStepResultRequest)
+      returns (ReportWorkflowStepResultResponse);
+  rpc TerminateWorkflowJob(TerminateWorkflowJobRequest)
+      returns (TerminateWorkflowJobResponse);
+  rpc RegisterWorkflowJobPhase(RegisterWorkflowJobPhaseRequest)
+      returns (RegisterWorkflowJobPhaseResponse);
+  rpc MarkWorkflowJobPhaseRunning(MarkWorkflowJobPhaseRunningRequest)
+      returns (MarkWorkflowJobPhaseRunningResponse);
+  rpc TerminateWorkflowJobPhase(TerminateWorkflowJobPhaseRequest)
+      returns (TerminateWorkflowJobPhaseResponse);
+}
+
+// ---- Enroll ----
+
+message EnrollRequest {
+  // EnrollToken is the `hgxe_` plaintext the operator passed to
+  // `hangrix-runner enroll`.
+  string enroll_token = 1;
+  // Capabilities is opaque JSON; the platform round-trips it into
+  // runners.capabilities. Empty bytes are normalised to `{}`
+  // server-side so the column is never null.
+  bytes capabilities = 2;
+}
+
+message EnrollResponse {
+  int64 runner_id = 1;
+  string runner_name = 2;
+  // AgentToken is the long-lived `hgxr_` plaintext. The runner must
+  // persist it and present it as the bearer credential on every
+  // subsequent RPC. Never returned twice.
+  string agent_token = 3;
+  BootstrapPayload bootstrap = 4;
+}
+
+// ---- Heartbeat ----
+
+message HeartbeatRequest {
+  bytes capabilities = 1;
+}
+
+message HeartbeatResponse {}
+
+// ---- Tasks (batch-aware) ----
+
+// Task is the polymorphic envelope returned by Tasks(). Exactly one
+// body variant is populated.
+message Task {
+  oneof body {
+    AgentSessionTask agent_session = 1;
+    WorkflowJobTask workflow_job = 2;
+  }
+}
+
+message TasksRequest {
+  // MaxBatch is the upper bound on the number of tasks the server may
+  // return in this single response. Zero / unset / 1 preserves the
+  // historical "at most one task per call" behaviour, so old runners
+  // see no change. New runners pass min(idleWorkers, hardCap).
+  // The server clamps to a hard cap (see Server.maxTasksPerPoll, set
+  // to 16 to match the runner's default Parallelism) regardless of
+  // what the client requests.
+  int32 max_batch = 1;
+}
+
+message TasksResponse {
+  // Tasks is the populated batch. Empty (len==0) means the long-poll
+  // window elapsed without work — the 204 equivalent.
+  repeated Task tasks = 1;
+  // task remains for old clients (deprecated). Server populates BOTH
+  // fields when the batch contains exactly 1 task AND the client did
+  // not opt in to batching (max_batch <= 1), so old runners keep
+  // reading from `task` while new runners read from `tasks`.
+  Task task = 2 [deprecated = true];
+}
+
+// ---- Cleanup tasks ----
+
+message ListCleanupTasksRequest {}
+
+message ListCleanupTasksResponse {
+  repeated CleanupTask tasks = 1;
+}
+
+message MarkCleanupDoneRequest {
+  int64 session_id = 1;
+}
+
+message MarkCleanupDoneResponse {}
+
+// ---- Stop tasks ----
+
+message ListStopTasksRequest {}
+
+message ListStopTasksResponse {
+  repeated StopTask tasks = 1;
+}
+
+message MarkStopDoneRequest {
+  int64 session_id = 1;
+}
+
+message MarkStopDoneResponse {}
+
+// ---- Workflow job lifecycle ----
+
+message MarkWorkflowJobRunningRequest {
+  int64 job_run_id = 1;
+}
+
+message MarkWorkflowJobRunningResponse {}
+
+// AppendWorkflowJobLog ships one log line. `stream` is "stdout",
+// "stderr", or "system". `step_id` correlates the line with the
+// currently executing step; empty for between-step system log lines.
+message AppendWorkflowJobLogRequest {
+  int64 job_run_id = 1;
+  string stream = 2;
+  string line = 3;
+  string step_id = 4;
+}
+
+message AppendWorkflowJobLogResponse {}
+
+// ReportWorkflowStepResult records one step's exit code and any
+// captured `outputs` block. `masked` lists output keys that should be
+// rendered redacted in UI views.
+message ReportWorkflowStepResultRequest {
+  int64 job_run_id = 1;
+  int32 step_index = 2;
+  string step_id = 3;
+  int32 exit_code = 4;
+  map<string, string> outputs = 5;
+  repeated string masked = 6;
+}
+
+message ReportWorkflowStepResultResponse {}
+
+// TerminateWorkflowJob reports the job's final state. `status` is one
+// of "success" / "failed" / "cancelled".
+message TerminateWorkflowJobRequest {
+  int64 job_run_id = 1;
+  string status = 2;
+  int32 exit_code = 3;
+  string message = 4;
+}
+
+message TerminateWorkflowJobResponse {}
+
+// RegisterWorkflowJobPhase creates (or retrieves) a phase row for a
+// job. `sequence_index` controls UI ordering; `image_ref` is the
+// container image the phase will run in.
+message RegisterWorkflowJobPhaseRequest {
+  int64 job_run_id = 1;
+  string phase = 2;
+  int32 sequence_index = 3;
+  string image_ref = 4;
+}
+
+message RegisterWorkflowJobPhaseResponse {}
+
+message MarkWorkflowJobPhaseRunningRequest {
+  int64 job_run_id = 1;
+  string phase = 2;
+}
+
+message MarkWorkflowJobPhaseRunningResponse {}
+
+// TerminateWorkflowJobPhase records a phase's terminal status.
+// `exit_code` is optional (the runner doesn't always have a code; use
+// has_exit_code to distinguish "0" from "unknown").
+message TerminateWorkflowJobPhaseRequest {
+  int64 job_run_id = 1;
+  string phase = 2;
+  string status = 3;
+  int32 exit_code = 4;
+  bool has_exit_code = 5;
+  string message = 6;
+}
+
+message TerminateWorkflowJobPhaseResponse {}

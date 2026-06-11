@@ -1,0 +1,1241 @@
+// Package service holds the workflow module's stateless business logic:
+// config parsing, event matching, run creation, job advancement, and dispatch.
+// It composes domain.Store with repo file readers and config parsers.
+package service
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"os/exec"
+	"strings"
+	"sync"
+
+	"github.com/hangrix/hangrix/pkg/actor"
+
+	"github.com/hangrix/hangrix/apps/hangrix/internal/agentsconfig"
+	repodomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/repo/domain"
+	"github.com/hangrix/hangrix/apps/hangrix/internal/modules/workflow/domain"
+	"github.com/hangrix/hangrix/apps/hangrix/internal/workflowsconfig"
+)
+
+// Service is the stateless business-logic core for workflows. It
+// satisfies domain.Dispatcher and domain.CheckReader for cross-module
+// integration.
+//
+// Observers are registered LATE via RegisterObserver, not injected
+// through Deps. The Observer-pattern flow:
+//
+//	workflow.Service ──fires──> RunStatusObserver(s)
+//	                                  │
+//	                            CIStatusObserver
+//	                                  │
+//	                            needs Spawner
+//	                                  │
+//	                            needs AgentRunCreator (= workflow.Service)
+//
+// If observers were constructor-injected, the ioc graph would have a
+// cycle. Late registration breaks it: Service is built first with no
+// observers, then app bootstrap walks the container's
+// []RunStatusObserver bindings and calls RegisterObserver for each.
+// See workflow.WireObservers (module.go) and app/app.go's call site.
+type Service struct {
+	store   domain.Store
+	pathRes repodomain.PathResolver
+
+	observersMu sync.RWMutex
+	observers   []domain.RunStatusObserver
+}
+
+// Deps wires the service's dependencies through ioc.
+type Deps struct {
+	Store   domain.Store
+	PathRes repodomain.PathResolver
+}
+
+// New creates a ready-to-use workflow Service.
+func New(deps *Deps) *Service {
+	return &Service{
+		store:   deps.Store,
+		pathRes: deps.PathRes,
+	}
+}
+
+// RegisterObserver appends an observer to the notification fan-out.
+// Safe to call concurrently with each other and with notifyStatusChanged.
+// Typically invoked once per observer at app boot — see WireObservers.
+func (s *Service) RegisterObserver(o domain.RunStatusObserver) {
+	if o == nil {
+		return
+	}
+	s.observersMu.Lock()
+	s.observers = append(s.observers, o)
+	s.observersMu.Unlock()
+}
+
+// ---- config scanning ----
+
+// ScanWorkflowConfigs reads all .hangrix/workflows/*.yml files from a repo's
+// default branch and returns parsed+validated WorkflowConfigs.
+func (s *Service) ScanWorkflowConfigs(ctx context.Context, repo Ref) ([]*workflowsconfig.WorkflowConfig, error) {
+	fsPath, err := s.pathRes.ResolvePath(repo.OwnerName, repo.Name)
+	if err != nil {
+		return nil, fmt.Errorf("resolve repo path: %w", err)
+	}
+
+	// List files in .hangrix/workflows/
+	files, err := listWorkflowFiles(ctx, fsPath, repo.DefaultBranch)
+	if err != nil {
+		// Missing directory is not an error — just no workflows
+		return nil, nil
+	}
+
+	var configs []*workflowsconfig.WorkflowConfig
+	for _, file := range files {
+		raw, ok := readBlob(ctx, fsPath, repo.DefaultBranch, ".hangrix/workflows/"+file)
+		if !ok {
+			continue
+		}
+		cfg, err := workflowsconfig.ParseWorkflowConfig(raw, file)
+		if err != nil {
+			log.Printf("workflow: repo %d parse %s: %v", repo.ID, file, err)
+			continue
+		}
+		configs = append(configs, cfg)
+	}
+
+	if err := workflowsconfig.ValidateConfigSet(configs); err != nil {
+		log.Printf("workflow: repo %d validate config set: %v", repo.ID, err)
+		// Still return what we could parse; individual files may be usable
+	}
+
+	return configs, nil
+}
+
+// GetHostContainer reads the host repo's .hangrix/agents.yml and extracts
+// the container definition (image/build/entrypoint/volumes/env).
+func (s *Service) GetHostContainer(ctx context.Context, repo Ref) (*agentsconfig.Container, error) {
+	fsPath, err := s.pathRes.ResolvePath(repo.OwnerName, repo.Name)
+	if err != nil {
+		return nil, fmt.Errorf("resolve repo path: %w", err)
+	}
+
+	raw, ok := readBlob(ctx, fsPath, repo.DefaultBranch, ".hangrix/agents.yml")
+	if !ok {
+		return nil, fmt.Errorf("agents.yml not found in repo %s/%s", repo.OwnerName, repo.Name)
+	}
+
+	host, err := agentsconfig.ParseHostConfig(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse agents.yml: %w", err)
+	}
+
+	// Exactly one of Image or Build is guaranteed by agentsconfig validation.
+	// Both-empty is impossible here (ParseHostConfig would reject it), but we
+	// guard defensively.
+	if host.Container.Image == "" && host.Container.Build == nil {
+		return nil, fmt.Errorf("agents.yml has no container image or build defined")
+	}
+
+	return &host.Container, nil
+}
+
+// ---- event matching ----
+
+// FindMatchingWorkflows returns the subset of workflow configs whose `on`
+// triggers match the given event. For dispatch events, it returns the
+// single named workflow.
+func (s *Service) FindMatchingWorkflows(configs []*workflowsconfig.WorkflowConfig, event workflowsconfig.EventName, filter WorkflowEventFilter) []*workflowsconfig.WorkflowConfig {
+	var matched []*workflowsconfig.WorkflowConfig
+	for _, cfg := range configs {
+		for _, trigger := range cfg.On {
+			if trigger.Event != event {
+				continue
+			}
+			switch event {
+			case workflowsconfig.EventRepoPush:
+				if trigger.MatchesPushEvent(filter.Branch, filter.ChangedPaths) {
+					matched = append(matched, cfg)
+				}
+			case workflowsconfig.EventRepoPushTag:
+				if trigger.MatchesPushTagEvent(filter.Tag) {
+					matched = append(matched, cfg)
+				}
+			case workflowsconfig.EventIssueOpened:
+				matched = append(matched, cfg)
+			case workflowsconfig.EventIssueComment:
+				if trigger.MatchesCommentEvent(filter.FromRole, filter.FromUser, filter.MentionedWorkflow) {
+					matched = append(matched, cfg)
+				}
+			case workflowsconfig.EventWorkflowDispatch:
+				if cfg.Name == filter.WorkflowName {
+					matched = append(matched, cfg)
+				}
+			case workflowsconfig.EventContributionPush, workflowsconfig.EventIssuePush:
+				matched = append(matched, cfg)
+			}
+		}
+	}
+	return matched
+}
+
+// WorkflowEventFilter carries event-specific filtering criteria.
+type WorkflowEventFilter struct {
+	Branch            string
+	ChangedPaths      []string
+	Tag               string
+	FromRole          string
+	FromUser          string
+	MentionedWorkflow string
+	WorkflowName      string
+}
+
+// ---- run creation ----
+
+// DispatchInput is a user-provided input for workflow.dispatch.
+type DispatchInput struct {
+	Name  string
+	Value string
+}
+
+// CreateRunParams is the high-level input for creating a workflow run.
+type CreateRunParams struct {
+	Repo           Ref
+	Config         *workflowsconfig.WorkflowConfig
+	EventName      workflowsconfig.EventName
+	CauseID        *int64
+	Ref            string
+	CommitSHA      string
+	Container      *agentsconfig.Container
+	DispatchInputs []DispatchInput
+	// TriggerPayload, when non-nil, is stored verbatim in trigger_payload_json.
+	// When nil, the infra auto-generates a payload from EventName + DispatchInputs.
+	TriggerPayload []byte
+	// TriggerActor is the actor who triggered this workflow run.
+	// When zero, the service derives it from the trigger payload or event context.
+	TriggerActor actor.Ref
+	// RunActor is the workflow run itself as an actor for downstream side effects.
+	// When zero, the service derives a workflow actor from the config name.
+	RunActor actor.Ref
+}
+
+// CreateRun creates a new workflow run and all associated pending job runs.
+// It merges environment variables from container ← workflow ← job levels,
+// snapshots the container definition, and persists everything.
+func (s *Service) CreateRun(ctx context.Context, params CreateRunParams) (*domain.WorkflowRun, []*domain.WorkflowJobRun, error) {
+	// Build container snapshot
+	containerEnv := make(map[string]string)
+	if params.Container != nil {
+		for k, v := range params.Container.Env {
+			containerEnv[k] = v
+		}
+	}
+	// Merge workflow-level env over container
+	for k, v := range params.Config.Env {
+		containerEnv[k] = v
+	}
+
+	// Build dispatch inputs as WORKFLOW_INPUT_UPPER_SNAKE
+	dispatchInputs := make(map[string]string)
+	for _, in := range params.DispatchInputs {
+		key := "WORKFLOW_INPUT_" + strings.ToUpper(in.Name)
+		dispatchInputs[key] = in.Value
+	}
+
+	// Build job defs
+	jobDefs := make([]domain.JobDefInput, len(params.Config.Jobs))
+	for i, job := range params.Config.Jobs {
+		steps := make([]domain.StepInput, len(job.Steps))
+		for si, step := range job.Steps {
+			steps[si] = domain.StepInput{
+				Id:     strPtr(step.Id),
+				Name:   step.Name,
+				Type:   step.Type,
+				Run:    step.Run,
+				Script: step.Script,
+				Env:    step.Env,
+				Dir:    step.Dir,
+				With:   step.With,
+			}
+		}
+		jobDefs[i] = domain.JobDefInput{
+			JobKey:           job.Key,
+			DisplayName:      job.DisplayName,
+			Env:              job.Env,
+			TimeoutMinutes:   int32(job.TimeoutMinutes),
+			WorkingDirectory: job.WorkingDirectory,
+			Steps:            steps,
+			Outputs:          job.Outputs,
+		}
+	}
+
+	// Snapshot container spec
+	var snapImage string
+	var snapBuild *domain.BuildSpec
+	var snapEntrypoint []string
+	var snapVolumes []domain.VolumeSnapshot
+	if params.Container != nil {
+		snapEntrypoint = params.Container.Entrypoint
+		if params.Container.Build != nil {
+			snapBuild = &domain.BuildSpec{
+				Dockerfile: params.Container.Build.Dockerfile,
+				Context:    params.Container.Build.Context,
+				Args:       params.Container.Build.Args,
+			}
+		}
+		// Resolve the docker image tag — either the pre-built image
+		// (pulled by the runner) or the deterministic build tag the
+		// runner will use for `docker build -t <tag>`.
+		var err error
+		snapImage, err = agentsconfig.ResolveImageTag(params.Repo.ID, *params.Container)
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolve container image: %w", err)
+		}
+		for _, vol := range params.Container.Volumes {
+			snapVolumes = append(snapVolumes, domain.VolumeSnapshot{
+				Name:  vol.Name,
+				Mount: vol.Mount,
+			})
+		}
+	}
+
+	// Generate a short-term workflow token.
+	workflowToken, err := generateWorkflowToken()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate workflow token: %w", err)
+	}
+
+	// Derive actors if not explicitly provided by the caller.
+	triggerActor := params.TriggerActor
+	if triggerActor.IsZero() {
+		triggerActor = deriveTriggerActor(params.TriggerPayload, params.EventName)
+	}
+	runActor := params.RunActor
+	if runActor.IsZero() {
+		runActor = actor.WorkflowRef(0, params.Config.Name)
+	}
+
+	return s.store.CreateRun(ctx, domain.CreateRunParams{
+		RepoID:              params.Repo.ID,
+		WorkflowName:        params.Config.Name,
+		SourceFile:          params.Config.SourceFile,
+		EventName:           domain.EventName(params.EventName),
+		CauseID:             params.CauseID,
+		Ref:                 params.Ref,
+		CommitSHA:           params.CommitSHA,
+		ContainerEnv:        containerEnv,
+		ContainerImage:      snapImage,
+		ContainerBuild:      snapBuild,
+		ContainerEntrypoint: snapEntrypoint,
+		ContainerVolumes:    snapVolumes,
+		JobDefs:             jobDefs,
+		DispatchInputs:      dispatchInputs,
+		TriggerPayloadJSON:  params.TriggerPayload,
+		WorkflowToken:       workflowToken,
+		TriggerActor:        triggerActor,
+		RunActor:            runActor,
+	})
+}
+
+// ---- job advancement ----
+
+// AdvanceRun is called after a job transitions to a terminal status.
+// It either advances to the next pending job or marks the run terminal.
+func (s *Service) AdvanceRun(ctx context.Context, runID int64) error {
+	jobs, err := s.store.ListJobRunsByRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("advance run: list jobs: %w", err)
+	}
+
+	// Check if any job failed
+	allDone := true
+	anyFailed := false
+	var failedJobSeq int32
+
+	for _, job := range jobs {
+		switch job.Status {
+		case domain.JobStatusFailed:
+			anyFailed = true
+			allDone = true // stop on first failure
+			failedJobSeq = job.SequenceIndex
+		case domain.JobStatusPending, domain.JobStatusRunning:
+			allDone = false
+		}
+	}
+
+	if anyFailed {
+		// Skip remaining pending jobs
+		if err := s.store.SkipRemainingJobs(ctx, runID, failedJobSeq); err != nil {
+			return fmt.Errorf("advance run: skip remaining: %w", err)
+		}
+		if err := s.store.MarkRunTerminal(ctx, runID, domain.RunStatusFailed); err != nil {
+			return fmt.Errorf("advance run: mark terminal: %w", err)
+		}
+		s.notifyStatusChanged(ctx, domain.RunStatusRunning, runID)
+		return nil
+	}
+
+	if allDone {
+		// All jobs succeeded
+		if err := s.store.MarkRunTerminal(ctx, runID, domain.RunStatusSuccess); err != nil {
+			return fmt.Errorf("advance run: mark terminal: %w", err)
+		}
+		s.notifyStatusChanged(ctx, domain.RunStatusRunning, runID)
+		return nil
+	}
+
+	// Otherwise, the next pending job will be picked up by a runner
+	return nil
+}
+
+// ---- dispatcher (domain.Dispatcher) ----
+
+// ClaimNextJob claims the next pending workflow job for a runner.
+func (s *Service) ClaimNextJob(ctx context.Context, runnerID int64) (*domain.WorkflowJobRun, error) {
+	jobs, err := s.ClaimNextJobs(ctx, runnerID, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(jobs) == 0 {
+		return nil, domain.ErrNoPendingJob
+	}
+	return jobs[0], nil
+}
+
+// ClaimNextJobs claims up to limit pending workflow jobs for a runner.
+func (s *Service) ClaimNextJobs(ctx context.Context, runnerID int64, limit int) ([]*domain.WorkflowJobRun, error) {
+	jobs, err := s.store.ClaimNextJobs(ctx, runnerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	for _, job := range jobs {
+		parentRun, err := s.store.GetRun(ctx, job.WorkflowRunID)
+		if err != nil {
+			return nil, fmt.Errorf("claim next jobs: get run: %w", err)
+		}
+		if parentRun.Status == domain.RunStatusPending {
+			if err := s.store.MarkRunStarted(ctx, parentRun.ID); err != nil {
+				log.Printf("workflow: mark run %d started: %v", parentRun.ID, err)
+			} else {
+				s.notifyStatusChanged(ctx, domain.RunStatusPending, parentRun.ID)
+			}
+		}
+	}
+	return jobs, nil
+}
+
+// GetRunForJob returns the workflow run that owns the given job.
+func (s *Service) GetRunForJob(ctx context.Context, jobRunID int64) (*domain.WorkflowRun, error) {
+	job, err := s.store.GetJobRun(ctx, jobRunID)
+	if err != nil {
+		return nil, err
+	}
+	return s.store.GetRun(ctx, job.WorkflowRunID)
+}
+
+// ---- event triggers ----
+
+// TriggerTagEvent implements domain.TagEventTrigger. It scans workflow
+// configs, finds those matching repo.push_tag with the given tag name,
+// and creates a workflow run for each match. This is the single entry
+// point used by both the git-push PushObserver and the REST create-tag
+// handler.
+func (s *Service) TriggerTagEvent(ctx context.Context, repoID int64, ownerName, repoName, defaultBranch, tagName, commitSHA string) error {
+	ref := Ref{
+		ID:            repoID,
+		Name:          repoName,
+		DefaultBranch: defaultBranch,
+		OwnerName:     ownerName,
+	}
+
+	configs, err := s.ScanWorkflowConfigs(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("trigger tag event: scan configs: %w", err)
+	}
+	if len(configs) == 0 {
+		return nil
+	}
+
+	matched := s.FindMatchingWorkflows(configs, workflowsconfig.EventRepoPushTag, WorkflowEventFilter{Tag: tagName})
+	if len(matched) == 0 {
+		return nil
+	}
+
+	container, err := s.GetHostContainer(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("trigger tag event: get container: %w", err)
+	}
+
+	tagRef := "refs/tags/" + tagName
+	for _, cfg := range matched {
+		if _, _, err := s.CreateRun(ctx, CreateRunParams{
+			Repo:      ref,
+			Config:    cfg,
+			EventName: workflowsconfig.EventRepoPushTag,
+			Ref:       tagRef,
+			CommitSHA: commitSHA,
+			Container: container,
+		}); err != nil {
+			log.Printf("workflow: trigger tag event: create run for %s: %v", cfg.Name, err)
+		}
+	}
+	return nil
+}
+
+// ---- dispatch ----
+
+// Dispatch creates a new workflow run from a manual dispatch request.
+func (s *Service) Dispatch(ctx context.Context, repo Ref, workflowName string, inputs []DispatchInput, ref string) (*domain.WorkflowRun, []*domain.WorkflowJobRun, error) {
+	// Scan configs to find the named workflow
+	configs, err := s.ScanWorkflowConfigs(ctx, repo)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dispatch: scan configs: %w", err)
+	}
+
+	var cfg *workflowsconfig.WorkflowConfig
+	for _, c := range configs {
+		if c.Name == workflowName {
+			cfg = c
+			break
+		}
+	}
+	if cfg == nil {
+		return nil, nil, fmt.Errorf("workflow %q not found in repo", workflowName)
+	}
+
+	// Check that workflow.dispatch is declared
+	hasDispatch := false
+	for _, t := range cfg.On {
+		if t.Event == workflowsconfig.EventWorkflowDispatch {
+			hasDispatch = true
+			break
+		}
+	}
+	if !hasDispatch {
+		return nil, nil, fmt.Errorf("workflow %q does not accept dispatch triggers", workflowName)
+	}
+
+	// Validate inputs against declared dispatch inputs
+	declared := make(map[string]*workflowsconfig.DispatchInput)
+	for i := range cfg.DispatchInputs {
+		declared[cfg.DispatchInputs[i].Name] = &cfg.DispatchInputs[i]
+	}
+	for _, in := range inputs {
+		di, ok := declared[in.Name]
+		if !ok {
+			return nil, nil, fmt.Errorf("unknown dispatch input %q", in.Name)
+		}
+		_ = di // mark used
+	}
+	// Check required inputs are present
+	for _, di := range cfg.DispatchInputs {
+		if !di.Required {
+			continue
+		}
+		found := false
+		for _, in := range inputs {
+			if in.Name == di.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, nil, fmt.Errorf("required dispatch input %q not provided", di.Name)
+		}
+	}
+
+	// Resolve ref
+	commitSHA := ref
+	if ref == "" {
+		// Use default branch latest commit
+		fsPath, err := s.pathRes.ResolvePath(repo.OwnerName, repo.Name)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dispatch: resolve path: %w", err)
+		}
+		sha, err := resolveRef(ctx, fsPath, repo.DefaultBranch)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dispatch: resolve default branch: %w", err)
+		}
+		commitSHA = sha
+		ref = repo.DefaultBranch
+	}
+
+	// Get container from agents.yml
+	container, err := s.GetHostContainer(ctx, repo)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dispatch: get container: %w", err)
+	}
+
+	return s.CreateRun(ctx, CreateRunParams{
+		Repo:           repo,
+		Config:         cfg,
+		EventName:      workflowsconfig.EventWorkflowDispatch,
+		Ref:            ref,
+		CommitSHA:      commitSHA,
+		Container:      container,
+		DispatchInputs: inputs,
+	})
+}
+
+// DispatchRepoPush scans all workflow configs in a repo, finds every workflow
+// that matches repo.push for the given branch+paths, and creates a run for
+// each match. Failures for individual workflow configs are logged but do not
+// stop iteration. Returns the successfully-created runs. The caller should
+// call this as a best-effort side-effect — errors here must never roll back
+// the operation that triggered the dispatch.
+func (s *Service) DispatchRepoPush(ctx context.Context, repo Ref, branch string, changedPaths []string, triggerPayload []byte, commitSHA string) []*domain.WorkflowRun {
+	configs, err := s.ScanWorkflowConfigs(ctx, repo)
+	if err != nil {
+		log.Printf("workflow: DispatchRepoPush scan configs repo=%d: %v", repo.ID, err)
+		return nil
+	}
+
+	matches := s.FindMatchingWorkflows(configs, workflowsconfig.EventRepoPush, WorkflowEventFilter{
+		Branch:       branch,
+		ChangedPaths: changedPaths,
+	})
+
+	if len(matches) == 0 {
+		return nil
+	}
+
+	container, err := s.GetHostContainer(ctx, repo)
+	if err != nil {
+		log.Printf("workflow: DispatchRepoPush get container repo=%d: %v", repo.ID, err)
+		return nil
+	}
+
+	var runs []*domain.WorkflowRun
+	for _, cfg := range matches {
+		run, _, err := s.CreateRun(ctx, CreateRunParams{
+			Repo:           repo,
+			Config:         cfg,
+			EventName:      workflowsconfig.EventRepoPush,
+			Ref:            branch,
+			CommitSHA:      commitSHA,
+			Container:      container,
+			TriggerPayload: triggerPayload,
+		})
+		if err != nil {
+			log.Printf("workflow: DispatchRepoPush create run repo=%d workflow=%s: %v", repo.ID, cfg.Name, err)
+			continue
+		}
+		runs = append(runs, run)
+	}
+	return runs
+}
+
+// DispatchContributionPush implements domain.PushEventDispatcher. It scans
+// workflow configs, finds those subscribing to contribution.push, and creates
+// a run for each match. Errors are logged only — this is a best-effort side
+// effect that must never roll back the contribution upsert.
+func (s *Service) DispatchContributionPush(ctx context.Context, repo domain.Ref, in domain.ContributionPushInput) {
+	ref := Ref{ID: repo.ID, Name: repo.Name, DefaultBranch: repo.DefaultBranch, OwnerName: repo.OwnerName}
+	configs, err := s.ScanWorkflowConfigs(ctx, ref)
+	if err != nil {
+		log.Printf("workflow: DispatchContributionPush scan configs repo=%d: %v", repo.ID, err)
+		return
+	}
+	if len(configs) == 0 {
+		return
+	}
+
+	matches := s.FindMatchingWorkflows(configs, workflowsconfig.EventContributionPush, WorkflowEventFilter{
+		Branch:       in.RefName,
+		ChangedPaths: in.ChangedPaths,
+	})
+	if len(matches) == 0 {
+		return
+	}
+
+	container, err := s.GetHostContainer(ctx, ref)
+	if err != nil {
+		log.Printf("workflow: DispatchContributionPush get container repo=%d: %v", repo.ID, err)
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"event":           "contribution.push",
+		"contribution_id": 0, // caller can set if available
+		"agent_role":      in.AgentRole,
+		"ref_name":        in.RefName,
+	})
+	for _, cfg := range matches {
+		if _, _, err := s.CreateRun(ctx, CreateRunParams{
+			Repo:           ref,
+			Config:         cfg,
+			EventName:      workflowsconfig.EventContributionPush,
+			Ref:            in.RefName,
+			CommitSHA:      in.CommitSHA,
+			Container:      container,
+			TriggerPayload: payload,
+			TriggerActor:   in.TriggerActor,
+		}); err != nil {
+			log.Printf("workflow: DispatchContributionPush create run repo=%d workflow=%s: %v", repo.ID, cfg.Name, err)
+		}
+	}
+}
+
+// DispatchIssuePush implements domain.PushEventDispatcher. Same pattern as
+// DispatchContributionPush but for issue.push events.
+func (s *Service) DispatchIssuePush(ctx context.Context, repo domain.Ref, in domain.IssuePushInput) {
+	ref := Ref{ID: repo.ID, Name: repo.Name, DefaultBranch: repo.DefaultBranch, OwnerName: repo.OwnerName}
+	configs, err := s.ScanWorkflowConfigs(ctx, ref)
+	if err != nil {
+		log.Printf("workflow: DispatchIssuePush scan configs repo=%d: %v", repo.ID, err)
+		return
+	}
+	if len(configs) == 0 {
+		return
+	}
+
+	matches := s.FindMatchingWorkflows(configs, workflowsconfig.EventIssuePush, WorkflowEventFilter{
+		Branch:       in.BranchName,
+		ChangedPaths: in.ChangedPaths,
+	})
+	if len(matches) == 0 {
+		return
+	}
+
+	container, err := s.GetHostContainer(ctx, ref)
+	if err != nil {
+		log.Printf("workflow: DispatchIssuePush get container repo=%d: %v", repo.ID, err)
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"event":      "issue.push",
+		"cause":      in.Cause,
+		"commit_sha": in.CommitSHA,
+	})
+	for _, cfg := range matches {
+		if _, _, err := s.CreateRun(ctx, CreateRunParams{
+			Repo:           ref,
+			Config:         cfg,
+			EventName:      workflowsconfig.EventIssuePush,
+			Ref:            in.BranchName,
+			CommitSHA:      in.CommitSHA,
+			Container:      container,
+			TriggerPayload: payload,
+			TriggerActor:   in.TriggerActor,
+		}); err != nil {
+			log.Printf("workflow: DispatchIssuePush create run repo=%d workflow=%s: %v", repo.ID, cfg.Name, err)
+		}
+	}
+}
+
+// ---- token validation (domain.WorkflowTokenValidator) ----
+
+// ValidateWorkflowToken looks up a hangrix_wf_ token and returns the repo ID
+// it is scoped to. Returns ErrInvalidWorkflowToken if the token is not found
+// or the run is in a terminal state.
+func (s *Service) ValidateWorkflowToken(ctx context.Context, token string) (int64, error) {
+	repoID, _, _, status, err := s.store.GetRunByToken(ctx, token)
+	if err != nil {
+		return 0, domain.ErrInvalidWorkflowToken
+	}
+	if status.Terminal() {
+		return 0, domain.ErrInvalidWorkflowToken
+	}
+	return repoID, nil
+}
+
+// ValidateWorkflowTokenWithActor validates a hangrix_wf_ token and returns
+// both the repo ID and a workflow actor.Ref for provenance tracking.
+// Returns ErrInvalidWorkflowToken if the token is not found or the run
+// is in a terminal state.
+func (s *Service) ValidateWorkflowTokenWithActor(ctx context.Context, token string) (int64, actor.Ref, error) {
+	repoID, runID, workflowName, status, err := s.store.GetRunByToken(ctx, token)
+	if err != nil {
+		return 0, actor.Ref{}, domain.ErrInvalidWorkflowToken
+	}
+	if status.Terminal() {
+		return 0, actor.Ref{}, domain.ErrInvalidWorkflowToken
+	}
+	return repoID, actor.WorkflowRef(runID, workflowName), nil
+}
+
+// SetStepOutputs merges a step's outputs into the job's step_outputs_json.
+func (s *Service) SetStepOutputs(ctx context.Context, id int64, stepID string, outputs map[string]domain.StepOutputValue) error {
+	return s.store.SetStepOutputs(ctx, id, stepID, outputs)
+}
+
+// SetJobOutputs writes resolved job outputs after job completion.
+func (s *Service) SetJobOutputs(ctx context.Context, id int64, outputs map[string]domain.StepOutputValue) error {
+	return s.store.SetJobOutputs(ctx, id, outputs)
+}
+
+// ResolveJobOutputs resolves $\{\{ \}\} expressions in job output templates
+// against the step outputs captured during execution. It resolves expressions like
+// $\{\{ steps.<id>.outputs.<key> \}\} and propagates the Masked flag from the
+// referenced step output.
+func (s *Service) ResolveJobOutputs(ctx context.Context, jobID int64) error {
+	job, err := s.store.GetJobRun(ctx, jobID)
+	if err != nil {
+		return fmt.Errorf("resolve job outputs: get job: %w", err)
+	}
+
+	if len(job.JobOutputsRawJSON) == 0 {
+		return nil // no outputs declared
+	}
+
+	var rawOutputs map[string]string
+	if err := json.Unmarshal(job.JobOutputsRawJSON, &rawOutputs); err != nil {
+		return fmt.Errorf("resolve job outputs: unmarshal raw: %w", err)
+	}
+
+	// Build the flat context for expression resolution and track masked keys.
+	// Each step output key becomes steps.<stepID>.outputs.<key> = value.
+	outputCtx := make(map[string]string)
+	maskedSet := make(map[string]bool)
+	if len(job.StepOutputsJSON) > 0 {
+		var stepOutputs map[string]map[string]domain.StepOutputValue
+		if err := json.Unmarshal(job.StepOutputsJSON, &stepOutputs); err != nil {
+			return fmt.Errorf("resolve job outputs: unmarshal step outputs: %w", err)
+		}
+		for stepID, outputs := range stepOutputs {
+			for key, sov := range outputs {
+				ctxKey := "steps." + stepID + ".outputs." + key
+				outputCtx[ctxKey] = sov.Value
+				if sov.Masked {
+					maskedSet[ctxKey] = true
+				}
+			}
+		}
+	}
+
+	resolved := make(map[string]domain.StepOutputValue)
+	for outputKey, template := range rawOutputs {
+		masked := false
+		for ctxKey := range maskedSet {
+			if strings.Contains(template, "${{ "+ctxKey+" }}") {
+				masked = true
+				break
+			}
+		}
+		resolved[outputKey] = domain.StepOutputValue{
+			Value:  resolveExpression(template, outputCtx),
+			Masked: masked,
+		}
+	}
+
+	return s.store.SetJobOutputs(ctx, jobID, resolved)
+}
+
+// deriveTriggerActor parses the trigger actor from the trigger payload when
+// available (e.g. pusher_user_id / pusher_agent_role for push events).
+// Falls back to system when no actor can be determined.
+func deriveTriggerActor(triggerPayload []byte, eventName workflowsconfig.EventName) actor.Ref {
+	if len(triggerPayload) == 0 {
+		return actor.SystemRef()
+	}
+	var payload struct {
+		PusherUserID    int64  `json:"pusher_user_id"`
+		PusherAgentRole string `json:"pusher_agent_role"`
+		AuthorID        int64  `json:"author_id"`
+		AgentRole       string `json:"agent_role"`
+	}
+	if err := json.Unmarshal(triggerPayload, &payload); err != nil {
+		return actor.SystemRef()
+	}
+	if payload.PusherAgentRole != "" {
+		return actor.AgentRef(payload.PusherAgentRole)
+	}
+	if payload.PusherUserID > 0 {
+		return actor.UserRef(payload.PusherUserID, "")
+	}
+	if payload.AgentRole != "" {
+		return actor.AgentRef(payload.AgentRole)
+	}
+	if payload.AuthorID > 0 {
+		return actor.UserRef(payload.AuthorID, "")
+	}
+	return actor.SystemRef()
+}
+
+// strPtr returns a pointer to s, or nil if s is empty.
+func strPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// resolveExpression resolves $\{\{ \}\} expressions in s using the given context.
+// Only supports $\{\{ steps.<id>.outputs.<key> \}\} expressions in v1.
+func resolveExpression(s string, ctx map[string]string) string {
+	// Simple $\{\{ ... \}\} resolver.
+	result := s
+	for {
+		start := strings.Index(result, "${{ ")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(result[start:], " }}")
+		if end == -1 {
+			break
+		}
+		key := strings.TrimSpace(result[start+4 : start+end])
+		if val, ok := ctx[key]; ok {
+			result = result[:start] + val + result[start+end+3:]
+		} else {
+			// Unknown expression — leave as-is.
+			break
+		}
+	}
+	return result
+}
+
+// generateWorkflowToken creates a new hangrix_wf_<8>_<32> hex token.
+func generateWorkflowToken() (string, error) {
+	randomBytes := make([]byte, 4)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return "", err
+	}
+	short := hex.EncodeToString(randomBytes)
+
+	longBytes := make([]byte, 16)
+	if _, err := rand.Read(longBytes); err != nil {
+		return "", err
+	}
+	long := hex.EncodeToString(longBytes)
+
+	return "hangrix_wf_" + short + "_" + long, nil
+}
+
+// ---- helpers ----
+
+// Ref is a lightweight reference to a repo, used by the service.
+type Ref struct {
+	ID            int64
+	Name          string
+	DefaultBranch string
+	OwnerName     string
+}
+
+// listWorkflowFiles returns the names of all .yml/.yaml files in
+// .hangrix/workflows/ on the given branch.
+func listWorkflowFiles(ctx context.Context, fsPath, ref string) ([]string, error) {
+	cmd := exec.CommandContext(ctx,
+		"git",
+		"--git-dir="+fsPath,
+		"ls-tree",
+		"--name-only",
+		ref+":.hangrix/workflows",
+	)
+	cmd.Stderr = io.Discard
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasSuffix(line, ".yml") || strings.HasSuffix(line, ".yaml") {
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
+// readBlob reads a file at ref:path from a bare repo.
+func readBlob(ctx context.Context, repoFsPath, ref, path string) ([]byte, bool) {
+	cmd := exec.CommandContext(ctx,
+		"git",
+		"--git-dir="+repoFsPath,
+		"cat-file",
+		"-p",
+		ref+":"+path,
+	)
+	cmd.Stderr = io.Discard
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// resolveRef resolves a branch or tag name to a commit SHA.
+func resolveRef(ctx context.Context, fsPath, ref string) (string, error) {
+	cmd := exec.CommandContext(ctx,
+		"git",
+		"--git-dir="+fsPath,
+		"rev-parse",
+		ref,
+	)
+	cmd.Stderr = io.Discard
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// ---- store pass-through methods (for handler access) ----
+
+// GetRun returns a workflow run by ID.
+func (s *Service) GetRun(ctx context.Context, id int64) (*domain.WorkflowRun, error) {
+	return s.store.GetRun(ctx, id)
+}
+
+// ListJobRuns returns all job runs for a workflow run.
+func (s *Service) ListJobRuns(ctx context.Context, workflowRunID int64) ([]*domain.WorkflowJobRun, error) {
+	return s.store.ListJobRunsByRun(ctx, workflowRunID)
+}
+
+// ListLogs returns log lines for a job run.
+func (s *Service) ListLogs(ctx context.Context, jobRunID int64, stepID *string, sinceID int64, offset, limit int32) ([]*domain.WorkflowJobLogLine, int64, error) {
+	return s.store.ListLogs(ctx, jobRunID, stepID, sinceID, offset, limit)
+}
+
+// MarkJobRunning transitions a job to running.
+func (s *Service) MarkJobRunning(ctx context.Context, jobID, runnerID int64) error {
+	return s.store.MarkJobRunning(ctx, jobID, runnerID)
+}
+
+// MarkJobTerminal transitions a job to a terminal status.
+func (s *Service) MarkJobTerminal(ctx context.Context, jobID int64, status domain.JobStatus, exitCode *int32, errMsg string) error {
+	return s.store.MarkJobTerminal(ctx, jobID, status, exitCode, errMsg)
+}
+
+// CancelRun cancels a workflow run: cancels running jobs, skips pending
+// jobs, marks the run as cancelled, and notifies observers.
+func (s *Service) CancelRun(ctx context.Context, runID int64) error {
+	run, err := s.store.GetRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("cancel run: get run: %w", err)
+	}
+
+	if run.Status.Terminal() {
+		return domain.ErrInvalidStatus
+	}
+
+	oldStatus := run.Status
+
+	// Cancel all running jobs.
+	if err := s.store.CancelRunningJobs(ctx, runID); err != nil {
+		return fmt.Errorf("cancel run: cancel running jobs: %w", err)
+	}
+
+	// Skip all remaining pending jobs (after_sequence_index = -1 catches everything).
+	if err := s.store.SkipRemainingJobs(ctx, runID, -1); err != nil {
+		return fmt.Errorf("cancel run: skip remaining: %w", err)
+	}
+
+	// Mark the run as cancelled.
+	if err := s.store.MarkRunTerminal(ctx, runID, domain.RunStatusCancelled); err != nil {
+		return fmt.Errorf("cancel run: mark terminal: %w", err)
+	}
+
+	s.notifyStatusChanged(ctx, oldStatus, runID)
+	return nil
+}
+
+// AppendLog appends a log line to a job run.
+
+// ---- observer notification ----
+
+// notifyStatusChanged fetches the current run state and calls every
+// registered RunStatusObserver with the old→new transition.
+// Errors from observers are logged but never propagated — status-change
+// notification is a best-effort side effect.
+func (s *Service) notifyStatusChanged(ctx context.Context, oldStatus domain.RunStatus, runID int64) {
+	// Snapshot under RLock so a concurrent RegisterObserver doesn't
+	// race with iteration. The snapshot is shallow — observer
+	// implementations are responsible for their own goroutine safety.
+	s.observersMu.RLock()
+	if len(s.observers) == 0 {
+		s.observersMu.RUnlock()
+		return
+	}
+	observers := make([]domain.RunStatusObserver, len(s.observers))
+	copy(observers, s.observers)
+	s.observersMu.RUnlock()
+
+	run, err := s.store.GetRun(ctx, runID)
+	if err != nil {
+		log.Printf("workflow: notifyStatusChanged get run %d: %v", runID, err)
+		return
+	}
+	for _, obs := range observers {
+		if err := obs.OnRunStatusChanged(ctx, oldStatus, run); err != nil {
+			log.Printf("workflow: observer %T: %v", obs, err)
+		}
+	}
+}
+
+// ---- CheckReader (domain.CheckReader) ----
+
+// ListChecksByCommit returns job-level CI check items for the given repo and
+// commit SHA. Each job within a workflow run produces its own CheckItem — a
+// run with two jobs yields two items. Order: run.created_at DESC, then within
+// each run by job.sequence_index ASC.
+func (s *Service) ListChecksByCommit(ctx context.Context, repoID int64, commitSHA string) ([]domain.CheckItem, error) {
+	runs, err := s.store.ListRunsByRepoAndCommitSHA(ctx, repoID, commitSHA)
+	if err != nil {
+		return nil, err
+	}
+
+	var items []domain.CheckItem
+	for _, run := range runs {
+		jobs, err := s.store.ListJobRunsByRun(ctx, run.ID)
+		if err != nil {
+			log.Printf("workflow: ListChecksByCommit list jobs run=%d: %v", run.ID, err)
+			continue
+		}
+		for _, job := range jobs {
+			item := toJobCheckItem(run, job)
+			items = append(items, item)
+		}
+	}
+	if items == nil {
+		items = []domain.CheckItem{}
+	}
+	return items, nil
+}
+
+// toJobCheckItem converts a (run, job) pair into a single CheckItem.
+// It maps the internal job status to the 3-state check model:
+//   - pending → "pending", no conclusion
+//   - running → "running", no conclusion
+//   - terminal → "completed" + conclusion (success/failure/cancelled/skipped)
+func toJobCheckItem(run *domain.WorkflowRun, job *domain.WorkflowJobRun) domain.CheckItem {
+	name := run.WorkflowName + " / " + job.DisplayName
+	if job.DisplayName == "" {
+		name = run.WorkflowName + " / " + job.JobKey
+	}
+
+	// Map status to the 3-state check model the frontend expects.
+	var status, conclusion string
+	switch job.Status {
+	case domain.JobStatusPending:
+		status = "pending"
+	case domain.JobStatusRunning:
+		status = "running"
+	case domain.JobStatusSuccess:
+		status = "completed"
+		conclusion = "success"
+	case domain.JobStatusFailed:
+		status = "completed"
+		conclusion = "failure"
+	case domain.JobStatusCancelled:
+		status = "completed"
+		conclusion = "cancelled"
+	case domain.JobStatusSkipped:
+		status = "completed"
+		conclusion = "skipped"
+	default:
+		status = string(job.Status)
+	}
+
+	item := domain.CheckItem{
+		Name:         name,
+		Status:       status,
+		Conclusion:   conclusion,
+		JobRunID:     job.ID,
+		RunID:        run.ID,
+		WorkflowName: run.WorkflowName,
+		JobKey:       job.JobKey,
+		EventName:    string(run.EventName),
+	}
+
+	if job.StartedAt != nil {
+		s := job.StartedAt.UTC().Format("2006-01-02T15:04:05Z")
+		item.StartedAt = &s
+	}
+	if job.FinishedAt != nil {
+		s := job.FinishedAt.UTC().Format("2006-01-02T15:04:05Z")
+		item.FinishedAt = &s
+	}
+
+	return item
+}
+
+// StreamJobLog is a convenience method that writes the full log of a job to
+// the given io.Writer. It paginates internally (page_size=1000) to avoid
+// buffering everything in memory for large logs.
+func (s *Service) StreamJobLog(ctx context.Context, jobRunID int64, w io.Writer) error {
+	const pageSize int32 = 1000
+	var offset int32 = 0
+	for {
+		lines, total, err := s.store.ListLogs(ctx, jobRunID, nil, 0, offset, pageSize)
+		if err != nil {
+			return fmt.Errorf("stream job log: %w", err)
+		}
+		for _, l := range lines {
+			fmt.Fprintf(w, "[%s] %s\n", l.Stream, l.Line)
+		}
+		offset += int32(len(lines))
+		if int64(offset) >= total || len(lines) == 0 {
+			break
+		}
+	}
+	return nil
+}
+// AppendLog appends a log line to a job run. stepID is the currently-executing
+// step key, or nil when the line is emitted between steps (system logs, etc.).
+func (s *Service) AppendLog(ctx context.Context, jobRunID int64, stream domain.LogStream, line string, stepID *string) error {
+	return s.store.AppendLog(ctx, jobRunID, stream, line, stepID)
+}
+
+// GetJobRun returns a job run by ID.
+func (s *Service) GetJobRun(ctx context.Context, id int64) (*domain.WorkflowJobRun, error) {
+	return s.store.GetJobRun(ctx, id)
+}
+
+// ---- workflow job phases ----
+
+// RegisterPhase creates a phase row for a workflow job. Idempotent:
+// subsequent calls for the same (jobRunID, phase) return the existing row.
+func (s *Service) RegisterPhase(ctx context.Context, jobRunID int64, phase domain.PhaseKind, sequenceIndex int32, imageRef string) (*domain.JobPhase, error) {
+	// Validate phase kind.
+	switch phase {
+	case domain.PhaseImagePull, domain.PhaseImageBuild, domain.PhaseContainerStart:
+		// valid
+	default:
+		return nil, fmt.Errorf("unknown phase kind: %q", phase)
+	}
+	return s.store.CreatePhase(ctx, jobRunID, phase, sequenceIndex, imageRef)
+}
+
+// MarkPhaseRunning transitions a phase to 'running'.
+func (s *Service) MarkPhaseRunning(ctx context.Context, jobRunID int64, phase domain.PhaseKind) error {
+	return s.store.MarkPhaseRunning(ctx, jobRunID, phase)
+}
+
+// MarkPhaseTerminal transitions a phase to a terminal status.
+func (s *Service) MarkPhaseTerminal(ctx context.Context, jobRunID int64, phase domain.PhaseKind, status domain.PhaseStatus, exitCode *int32, errMsg string) error {
+	return s.store.MarkPhaseTerminal(ctx, jobRunID, phase, status, exitCode, errMsg)
+}
+
+// ListJobPhases returns all phases for a job.
+func (s *Service) ListJobPhases(ctx context.Context, jobRunID int64) ([]*domain.JobPhase, error) {
+	return s.store.ListPhasesByJob(ctx, jobRunID)
+}
+
+// ListRunsByRepo returns paginated workflow runs for a repo.
+func (s *Service) ListRunsByRepo(ctx context.Context, repoID int64, workflowName, status string, offset, limit int32) ([]*domain.WorkflowRun, int64, error) {
+	return s.store.ListRunsByRepo(ctx, repoID, workflowName, status, offset, limit)
+}
+
+// ListAgentRunsByRepo returns paginated _agent workflow runs for a repo.
+func (s *Service) ListAgentRunsByRepo(ctx context.Context, repoID int64, status string, offset, limit int32) ([]*domain.WorkflowRun, int64, error) {
+	return s.store.ListAgentRunsByRepo(ctx, repoID, status, offset, limit)
+}
+
+// ListRunsByCommitSHA returns workflow runs for a repo matching the given
+// commit SHA, ordered by created_at DESC.
+func (s *Service) ListRunsByCommitSHA(ctx context.Context, repoID int64, commitSHA string) ([]*domain.WorkflowRun, error) {
+	return s.store.ListRunsByRepoAndCommitSHA(ctx, repoID, commitSHA)
+}
+
+// Ensure json import is used
+var _ = json.Marshal

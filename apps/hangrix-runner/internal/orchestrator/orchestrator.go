@@ -1,0 +1,183 @@
+// Package orchestrator abstracts "given a session task, run a container
+// and hand back its stdio". One real implementation (DockerOrchestrator)
+// shells out to the docker CLI; tests use a FakeOrchestrator that runs
+// the agent binary directly without any container.
+//
+// Separating the surface lets the loop package be unit-tested without a
+// real docker daemon, and lets us swap to containerd or podman later
+// without touching the IO-forwarding code.
+//
+// # IPC Event Types
+//
+// The runner transports platform events to the agent via stdin JSON-Lines
+// (kind:"event"). Known event types the runner may deliver:
+//
+//   - "issue.comment"           — someone commented on the issue
+//   - "commit.pushed"           — a commit was pushed (issue branch or a
+//     contribution branch issue-<N>/<role>/<slug>); reviewers wake on this
+//   - "review_vote.posted"      — a reviewer cast a vote on a contribution
+//
+// The runner has no special handling for any event — it passes them through
+// transparently to the agent. Its only responsibility is ensuring the
+// workspace (cloned repo with credential helper) is ready for git push.
+package orchestrator
+
+import (
+	"context"
+	"io"
+)
+
+// Task is the parameter bag for Start. It mirrors client.Task minus
+// transport-only metadata; the loop builds this from a poll response.
+//
+// HostAddendumPath / AgentBinaryPath are host-side paths the orchestrator
+// bind-mounts into the container. HostWorkdir is where the agent should
+// be invoked from inside the container (canonical /workspace per spec).
+//
+// ContainerID is the long-lived container the platform already knows
+// about for this session (empty for a fresh session, or after the
+// previous container was reaped). When non-empty the orchestrator tries
+// to `docker exec` into it; falling back to a fresh container if the id
+// is stale (host rebooted, manual `docker rm`, etc.). The bound image
+// stays whatever was used at first create — see docs/agent-config.md
+// §"Session 模型".
+type Task struct {
+	SessionID int64
+	Image     string
+	// Entrypoint overrides the container's PID 1. First element is
+	// the argv0 passed to docker --entrypoint; subsequent elements
+	// are appended after the image name as CMD args. Empty / nil
+	// falls back to the orchestrator's built-in default
+	// (`/usr/bin/sleep infinity`) so the container stays alive as a
+	// passive docker-exec sandbox.
+	Entrypoint []string
+	// Build, when non-nil, tells the orchestrator to materialise
+	// Image via `docker build` against a Dockerfile inside the host
+	// repo (HostWorkdir/Build.Dockerfile) before `docker create`.
+	// The Image tag is the deterministic name the spawner sends
+	// down; the orchestrator only builds when `docker image inspect
+	// <Image>` reports the tag missing, so re-uses are free.
+	Build            *BuildSpec
+	AgentBinaryPath  string
+	HostAddendumPath string
+	HostWorkdir      string
+	Env              map[string]string
+	ContainerID      string
+	// Volumes carries the named volume cache mounts (name + in-
+	// container path) from the server task payload.
+	Volumes []Volume
+}
+
+// BuildSpec describes the docker-build inputs for a Task. Paths are
+// host-repo-relative; the orchestrator joins them with HostWorkdir to
+// reach files on disk.
+type BuildSpec struct {
+	Dockerfile string
+	Context    string
+	Args       map[string]string
+}
+
+// Volume is a container volume mount requested by the host repo
+// agents.yml. Name is the volume name; Mount is the in-container path.
+//
+// HostPath toggles the mount mode:
+//
+//   - HostPath == ""  → named Docker volume (`-v <name>:<mount>`). This is
+//     the default; cache volumes (pnpm-store, go-mod, go-build) use this.
+//
+//   - HostPath != ""  → read-only bind mount of the host directory at
+//     HostPath into the container at Mount (`-v <host>:<mount>:ro`).
+//     Used by the reserved `hangrix-agent` volume so the in-container
+//     agent binary is supplied by the runner instead of baked into the
+//     image. The runner sets HostPath to its agentbin extract directory
+//     when it sees Name == "hangrix-agent" in mapVolumes /
+//     orchestratorVolumes.
+type Volume struct {
+	Name     string
+	Mount    string
+	HostPath string
+}
+
+// Handle is the running container's stdio + wait surface. Stdin / Stdout
+// behave like os.Stdin / os.Stdout on the container's perspective:
+// writing to Stdin sends a line to the agent; reading from Stdout pulls
+// the next byte the agent emitted. Stop sends SIGTERM (graceful) and
+// returns the exit code via Wait.
+//
+// ContainerID returns the docker container id this handle is execing
+// into. Stable for the lifetime of the handle: the runner persists it
+// back to the platform after Start so the next trigger on the same
+// session reuses the same container (state preservation across runs).
+type Handle interface {
+	Stdin() io.WriteCloser
+	Stdout() io.Reader
+	Stderr() io.Reader
+	Wait() (exitCode int, err error)
+	Stop(ctx context.Context) error
+	ContainerID() string
+}
+
+// ExecHandle represents a running command inside an existing container.
+// The caller reads Stdout/Stderr line-by-line while the command runs,
+// then calls Wait to block until exit and collect the exit code.
+type ExecHandle interface {
+	Stdout() io.ReadCloser
+	Stderr() io.ReadCloser
+	Wait() (int, error)
+}
+
+// PhaseEvent is one line of output from a phase operation — either
+// stdout, stderr, or a runner-emitted system marker.
+type PhaseEvent struct {
+	Stream string // "stdout" | "stderr"
+	Line   string
+}
+
+// Orchestrator starts a session and returns its handle. The contract is
+// "Start blocks just long enough to launch the container, then returns";
+// long-running IO is consumed via the Handle. Start may fail synchronously
+// (image pull failure / cgroup denied / missing bind-mount source); the
+// loop translates those into terminal sessions with the error message
+// surfaced as `error_message`.
+//
+// RemoveContainer is used by the runner's cleanup sweeper to honour
+// platform-flagged cleanups (archive / user-delete / 7-day idle). The
+// implementation must be idempotent — calling on an already-gone id is
+// not an error, so the cleanup ACK is idempotent.
+//
+// WorkflowContainer creates a long-lived container (sleep infinity) for
+// workflow job execution without bind-mounting the agent binary or
+// execing into it. The returned container ID is used with Exec to run
+// step commands. When build is non-nil the orchestrator materialises
+// the image via docker build before creating the container (same pattern
+// as Start). This is now a backward-compatible thin wrapper; new callers
+// should use the phase-aware split methods below.
+//
+// Exec runs a command inside an existing container. The returned
+// ExecHandle streams stdout/stderr; the caller drains them and calls
+// Wait to collect the exit code.
+//
+// ---- Phase-aware split methods ----
+//
+// EnsureImagePulled pulls the given image when not present locally.
+// Returns immediately with skipped=true when the image is already cached.
+// events receives docker pull progress lines in real time; the caller
+// must close the channel when done.
+//
+// BuildImage builds the image from the supplied BuildSpec when not
+// present locally. Returns skipped=true on cache hit. events receives
+// docker build output line-by-line.
+//
+// CreateAndStartWorkflowContainer creates + starts the workflow container
+// without image resolution (caller must have called EnsureImagePulled /
+// BuildImage first). events receives container create/start diagnostics.
+type Orchestrator interface {
+	Start(ctx context.Context, task Task) (Handle, error)
+	RemoveContainer(ctx context.Context, containerID string) error
+	WorkflowContainer(ctx context.Context, image string, build *BuildSpec, entrypoint []string, hostWorkdir string, env map[string]string, volumes []Volume) (string, error)
+	Exec(ctx context.Context, containerID, workdir string, env map[string]string, args ...string) (ExecHandle, error)
+
+	EnsureImagePulled(ctx context.Context, image string, events chan<- PhaseEvent) (skipped bool, err error)
+	BuildImage(ctx context.Context, image string, build *BuildSpec, hostWorkdir string, events chan<- PhaseEvent) (skipped bool, err error)
+	CreateAndStartWorkflowContainer(ctx context.Context, image string, entrypoint []string, hostWorkdir string, volumes []Volume, events chan<- PhaseEvent) (containerID string, err error)
+}

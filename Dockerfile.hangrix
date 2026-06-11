@@ -1,0 +1,24 @@
+FROM postgres:17-alpine
+
+RUN apk add --no-cache git openssh-client tzdata
+
+WORKDIR /app
+
+COPY dist/hangrix_linux_amd64 /usr/local/bin/hangrix
+COPY apps/hangrix/conf/config.yaml /app/config.yaml
+
+RUN chmod +x /usr/local/bin/hangrix \
+  && mkdir -p /data/repos /data/assets /data/attachments
+
+ENV API_SERVER_ADDR=:8080
+ENV API_SERVER_URL=http://host.docker.internal:18081
+ENV API_DATABASE_DSN=postgres://hangrix:hangrix@postgres:5432/hangrix?sslmode=disable
+ENV API_REDIS_ADDR=redis:6379
+ENV API_STORAGE_REPOS_PATH=/data/repos
+ENV API_STORAGE_ASSETS_PATH=/data/assets
+ENV API_STORAGE_ATTACHMENTS_PATH=/data/attachments
+
+EXPOSE 8080
+
+ENTRYPOINT []
+CMD ["hangrix", "--config", "/app/config.yaml"]

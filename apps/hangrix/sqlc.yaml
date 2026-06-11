@@ -1,0 +1,360 @@
+version: "2"
+sql:
+  - engine: postgresql
+    queries: internal/modules/actor/infra/queries.sql
+    # Actor module FK references to users(id), repos(id), and
+    # agent_sessions(id) (in the runner module); union those schemas
+    # so sqlc can resolve references at generate time. At runtime
+    # each module applies only its own migrations via goose_actor.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/repo/infra/migrations
+      - internal/modules/runner/infra/migrations
+      - internal/modules/actor/infra/migrations
+    gen:
+      go:
+        package: actordb
+        out: internal/modules/actor/infra/actordb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+  - engine: postgresql
+    queries: internal/modules/user/infra/queries.sql
+    schema: internal/modules/user/infra/migrations
+    gen:
+      go:
+        package: userdb
+        out: internal/modules/user/infra/userdb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+  - engine: postgresql
+    queries: internal/modules/org/infra/queries.sql
+    # Org migrations reference users(id) and actors(id); union the user and
+    # actor schemas so sqlc can resolve the FK. At runtime each module applies
+    # only its own migrations.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/actor/infra/migrations
+      - internal/modules/org/infra/migrations
+    gen:
+      go:
+        package: orgdb
+        out: internal/modules/org/infra/orgdb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+  - engine: postgresql
+    queries: internal/modules/repo/infra/queries.sql
+    # Repo migrations FK users(id), organizations(id), and actors(id); union
+    # all four schemas so sqlc can parse the joins. At runtime each module
+    # still applies only its own migrations via goose with a module-scoped
+    # version table; the repo module declares an org dependency in its ioc
+    # deps so org migrations win the build-order race.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/actor/infra/migrations
+      - internal/modules/repo/infra/migrations
+    gen:
+      go:
+        package: repodb
+        out: internal/modules/repo/infra/repodb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+  - engine: postgresql
+    queries: internal/modules/token/infra/queries.sql
+    # token migrations FK users(id), same trick as repo: union the schemas so
+    # sqlc can resolve the reference; at runtime each module applies only its
+    # own migrations.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/token/infra/migrations
+    gen:
+      go:
+        package: tokendb
+        out: internal/modules/token/infra/tokendb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+  - engine: postgresql
+    queries: internal/modules/llm_provider/infra/queries.sql
+    # llm_providers FKs actors(id) for actor_id; llm_usage_log keeps no FK
+    # to the runner module so the schema set stays narrow.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/actor/infra/migrations
+      - internal/modules/llm_provider/infra/migrations/00001_create_llm_providers.sql
+      - internal/modules/llm_provider/infra/migrations/00002_add_provider_disabled.sql
+      - internal/modules/llm_provider/infra/migrations/00003_add_usage_body_columns.sql
+      - internal/modules/llm_provider/infra/migrations/00005_fix_mock_provider_constraint.sql
+      - internal/modules/llm_provider/infra/migrations/00006_add_actor_id_to_llm_providers.sql
+      - internal/modules/llm_provider/infra/migrations/00007_create_model_groups.sql
+      - internal/modules/llm_provider/infra/migrations/00008_create_llm_models.sql
+    gen:
+      go:
+        package: llmproviderdb
+        out: internal/modules/llm_provider/infra/llmproviderdb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+  - engine: postgresql
+    queries: internal/modules/issue/infra/queries.sql
+    # issue_* tables FK users(id), repos(id), and actors(id); union
+    # those so sqlc can resolve the joins. Runtime migrations are still
+    # applied per-module via the goose_issue version table.
+    # Questionnaire schema is unioned here so issue indicator queries
+    # can join questionnaire and questionnaire_answers tables directly
+    # in batch — avoids N×2 cross-module service calls on the list hot
+    # path. At runtime each module applies only its own migrations.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/repo/infra/migrations
+      - internal/modules/actor/infra/migrations
+      - internal/modules/issue/infra/migrations
+      - internal/modules/questionnaire/infra/migrations
+    gen:
+      go:
+        package: issuedb
+        out: internal/modules/issue/infra/issuedb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+  - engine: postgresql
+    queries: internal/modules/runner/infra/queries.sql
+    # runner tables FK users(id) (created_by → dropped), actors(id)
+    # (created_by_actor_id, actor_id), and repos(id) (agent_sessions.repo_id);
+    # union user + org + repo + actor migrations so sqlc can resolve all
+    # references. At runtime each module applies only its own migrations.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/repo/infra/migrations
+      - internal/modules/actor/infra/migrations
+      - internal/modules/runner/infra/migrations
+    gen:
+      go:
+        package: runnerdb
+        out: internal/modules/runner/infra/runnerdb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+  - engine: postgresql
+    queries: internal/modules/automation/infra/queries.sql
+    # automation_runs FKs repos(id); union repo + its transitive schemas
+    # so sqlc can resolve the reference at generate time.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/repo/infra/migrations
+      - internal/modules/automation/infra/migrations
+    gen:
+      go:
+        package: automationdb
+        out: internal/modules/automation/infra/automationdb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+
+  - engine: postgresql
+    queries: internal/modules/release/infra/queries.sql
+    # release tables FK repos(id); union repo + its transitive schemas
+    # so sqlc can resolve the reference at generate time.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/repo/infra/migrations
+      - internal/modules/release/infra/migrations
+    gen:
+      go:
+        package: releasedb
+        out: internal/modules/release/infra/releasedb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+
+
+  - engine: postgresql
+    queries: internal/modules/workflow/infra/queries.sql
+    # workflow tables FK repos(id) and runners(id); union repo + runner + their
+    # transitive schemas so sqlc can resolve references at generate time.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/repo/infra/migrations
+      - internal/modules/runner/infra/migrations
+      - internal/modules/workflow/infra/migrations
+    gen:
+      go:
+        package: workflowdb
+        out: internal/modules/workflow/infra/workflowdb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+
+  - engine: postgresql
+    queries: internal/modules/dashboard/infra/queries.sql
+    # Dashboard queries read llm_usage_log (llm_provider module), agent_sessions,
+    # and runners (runner module). Union all four schemas so sqlc can resolve
+    # every table reference. No migrations live here — the dashboard only reads.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/repo/infra/migrations
+      - internal/modules/actor/infra/migrations
+      - internal/modules/llm_provider/infra/migrations/00001_create_llm_providers.sql
+      - internal/modules/llm_provider/infra/migrations/00002_add_provider_disabled.sql
+      - internal/modules/llm_provider/infra/migrations/00003_add_usage_body_columns.sql
+      - internal/modules/llm_provider/infra/migrations/00005_fix_mock_provider_constraint.sql
+      - internal/modules/llm_provider/infra/migrations/00006_add_actor_id_to_llm_providers.sql
+      - internal/modules/llm_provider/infra/migrations/00007_create_model_groups.sql
+      - internal/modules/llm_provider/infra/migrations/00008_create_llm_models.sql
+      - internal/modules/runner/infra/migrations
+    gen:
+      go:
+        package: dashboarddb
+        out: internal/modules/dashboard/infra/dashboarddb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+
+  - engine: postgresql
+    queries: internal/modules/attachment/infra/queries.sql
+    # attachments FK actors(id); comment_attachments FK issue_comments(id)
+    # and attachments(id). Union user + actor + issue (and its transitive
+    # schemas) so sqlc can resolve all references at generate time.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/actor/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/repo/infra/migrations
+      - internal/modules/issue/infra/migrations
+      - internal/modules/attachment/infra/migrations
+    gen:
+      go:
+        package: attachmentdb
+        out: internal/modules/attachment/infra/attachmentdb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+
+  - engine: postgresql
+    queries: internal/modules/questionnaire/infra/queries.sql
+    # questionnaire tables FK issues(id) and actors(id); union user + actor + org +
+    # repo + issue + questionnaire schemas so sqlc can resolve both
+    # references at generate time. Runtime still applies only its own
+    # migrations via goose_questionnaire.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/actor/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/repo/infra/migrations
+      - internal/modules/issue/infra/migrations
+      - internal/modules/questionnaire/infra/migrations
+    gen:
+      go:
+        package: questionnairedb
+        out: internal/modules/questionnaire/infra/questionnairedb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+
+
+  - engine: postgresql
+    queries: internal/modules/platform_settings/infra/queries.sql
+    # platform_settings is a standalone module with no foreign keys.
+    schema:
+      - internal/modules/platform_settings/infra/migrations
+    gen:
+      go:
+        package: platformsettingsdb
+        out: internal/modules/platform_settings/infra/platformsettingsdb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+
+  - engine: postgresql
+    queries: internal/modules/repo_silence/infra/queries.sql
+    # repo_silence is a standalone module with no foreign keys to
+    # other modules — schema is just its own migrations.
+    schema:
+      - internal/modules/repo_silence/infra/migrations
+    gen:
+      go:
+        package: reposilencedb
+        out: internal/modules/repo_silence/infra/reposilencedb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+
+  - engine: postgresql
+    queries: internal/modules/plan_engine/infra/queries.sql
+    # plan_state FK issues(id); union issue + its transitive schemas
+    # so sqlc can resolve the FK at generate time.
+    schema:
+      - internal/modules/user/infra/migrations
+      - internal/modules/org/infra/migrations
+      - internal/modules/repo/infra/migrations
+      - internal/modules/issue/infra/migrations
+      - internal/modules/plan_engine/infra/migrations
+    gen:
+      go:
+        package: planenginedb
+        out: internal/modules/plan_engine/infra/planenginedb
+        sql_package: pgx/v5
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_interface: false
+        emit_exact_table_names: false
+        emit_empty_slices: true
+

@@ -1,0 +1,388 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hangrix.dev/schemas/agents.schema.json",
+  "title": "Hangrix host repo agents.yml",
+  "description": "Schema for the TEAM-LEVEL .hangrix/agents.yml. Mirrors the parse contract enforced by internal/agentsconfig. Roles are NOT declared here — each role is a separate file .hangrix/agents/<role-key>.md whose YAML front matter follows the #/$defs/agentFrontMatter shape below (the Markdown body is the role's prompt). Unknown keys are silently dropped for forward compatibility; malformed value types and out-of-range values are still rejected.",
+  "type": "object",
+  "required": ["version", "container"],
+  "properties": {
+    "version": {
+      "description": "Schema version. Only 1 is currently accepted.",
+      "const": 1
+    },
+    "container": { "$ref": "#/$defs/container" },
+    "llm": { "$ref": "#/$defs/llm" },
+    "issues": { "$ref": "#/$defs/issues" },
+    "silence": { "$ref": "#/$defs/silence" },
+    "reviewers": { "$ref": "#/$defs/reviewers" },
+    "tools": {
+      "description": "Reusable tool rules: map of rule-name to a list of platform tool-name glob patterns (`*` wildcard). A role references rule names in its `tools:` front-matter field and sees the union of their patterns. Whitelist-only and platform-tools-only — local tools (read/write/edit/glob/grep/bash/bash_input/webfetch/sleep/compact_session) are never restricted. Enforced agent-side (hidden from the LLM tool schema); the server gates the v1 API by `permission:` alone. Each pattern is a glob over the names listed in #/$defs/platformTool — the runtime evaluates `*` wildcards against the live catalogue.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Platform-tool name or glob pattern. See #/$defs/platformTool for the documented catalogue; the runtime accepts any string so new tools work without a schema bump.",
+          "$comment": "Not using a $ref to platformTool here because that would coerce items to its `examples`; we want soft hints without rejecting forward-compat names."
+        },
+        "minItems": 1
+      }
+    }
+  },
+  "$defs": {
+    "container": {
+      "type": "object",
+      "description": "Runtime environment shared by every role. Exactly one of `image` or `build` must be set.",
+      "oneOf": [
+        {
+          "required": ["image"],
+          "not": { "required": ["build"] }
+        },
+        {
+          "required": ["build"],
+          "not": { "required": ["image"] }
+        }
+      ],
+      "properties": {
+        "image": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Fully-qualified registry pull spec, e.g. ghcr.io/acme/dev:1.2.3."
+        },
+        "build": {
+          "type": "object",
+          "required": ["dockerfile"],
+          "properties": {
+            "dockerfile": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Repo-relative path to the Dockerfile; conventionally .hangrix/agent.Dockerfile."
+            },
+            "context": {
+              "type": "string",
+              "description": "Build context root, repo-relative. Defaults to repo root when omitted."
+            },
+            "args": {
+              "type": "object",
+              "additionalProperties": { "type": "string" },
+              "description": "Build-arg map passed to `docker build --build-arg`. String values only."
+            }
+          }
+        },
+        "entrypoint": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Overrides the container's PID 1. First element becomes `docker create --entrypoint`; subsequent elements are appended after the image name as CMD args. Omit / empty list = the runner uses its built-in default `/usr/bin/sleep infinity` so the container is a passive docker-exec sandbox. Set to e.g. `[\"/init\"]` (s6-overlay) when the image bakes in a supervisor that should auto-start background services."
+        },
+        "env": {
+          "type": "object",
+          "description": "Plain-text env vars injected into every role container. Keys uppercase `[A-Z_][A-Z0-9_]*`; values support `${VAR_NAME}` whole-value references to repo variables and secrets (expanded by the runner at session start).",
+          "patternProperties": {
+            "^[A-Z_][A-Z0-9_]*$": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "volumes": {
+          "type": "array",
+          "description": "Repo-scoped named caches bind-mounted into the container.",
+          "items": { "$ref": "#/$defs/volume" }
+        }
+      }
+    },
+    "volume": {
+      "type": "object",
+      "required": ["name", "mount"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Platform-scoped identifier (e.g. pnpm-store). Runner namespaces by repo id automatically."
+        },
+        "mount": {
+          "type": "string",
+          "description": "Absolute path inside the container. `..` segments are rejected.",
+          "pattern": "^/",
+          "not": { "pattern": "(^|/)\\.\\.($|/)" }
+        }
+      }
+    },
+    "llm": {
+      "type": "object",
+      "description": "LLM tuning block. Appears at team level (top-level llm:) and per-role. Merge is field-by-field: any field present at role level overrides team, any field omitted at role level inherits team's value. At team level `model` is required; at role level `model` MAY be omitted to inherit team's. (JSON-Schema cannot express that conditional, so `required` is not declared here — the Go parser enforces it.)",
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Model name; must match a defined model/group at runtime (provider allowed_models routing is deprecated). Required at team level; optional at role level (omit to inherit team)."
+        },
+        "reasoning_effort": {
+          "type": "string",
+          "description": "Effort knob. The parser accepts any string for forward-compat; canonical values 'minimal' / 'low' / 'medium' / 'high' / 'xhigh' / 'max'. On the Anthropic adapter this maps to `output_config.effort` (Claude 4.6+ canonical — controls thinking depth AND overall token spend including tool calls); the legacy `thinking.budget_tokens` translation only fires when `thinking: enabled` is set. OpenAI-compat adapters pass it through verbatim. Empty string is equivalent to omission."
+        },
+        "thinking": {
+          "type": "string",
+          "enum": ["adaptive", "enabled", "disabled"],
+          "description": "Anthropic extended-thinking mode. 'adaptive' (Claude 4.6+ canonical — `thinking: {type: adaptive}`; the only mode Opus 4.7/4.8 accepts) lets the model decide per turn whether to reason, guided by `reasoning_effort`. 'enabled' is the legacy manual path (`thinking: {type: enabled, budget_tokens: N}` with N derived from reasoning_effort; supported on Claude 4.5/4.6). 'disabled' (or omitting the field) leaves extended thinking off. Non-Anthropic upstream adapters ignore this field."
+        },
+        "max_context_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Agent runtime cap on prompt + conversation-history tokens before truncation. 0 = no cap declared here."
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Per-call output budget (Anthropic max_tokens, OpenAI max_output_tokens). 0 = let the upstream apply its default."
+        }
+      }
+    },
+    "agentFrontMatter": {
+      "type": "object",
+      "required": ["triggers"],
+      "description": "Shape of the YAML front matter in a `.hangrix/agents/<role-key>.md` file (the role-key is the filename). The Markdown body after the front matter is the role's prompt and is required (it is not a front-matter field). This `$def` is documentation: the Go parser validates each agent file, not agents.yml, against this shape.",
+      "properties": {
+        "triggers": {
+          "type": "object",
+          "minProperties": 1,
+          "description": "Event subscription map (GitHub Actions style). Keys are recognised trigger constants; values are the per-event filter block (empty mapping `{}` = no filter). No wildcards.",
+          "additionalProperties": false,
+          "properties": {
+            "issue.opened": { "$ref": "#/$defs/triggerFilterless" },
+            "issue.closed": { "$ref": "#/$defs/triggerFilterless" },
+            "sub_issue.merged": { "$ref": "#/$defs/triggerFilterless" },
+            "sub_issue.closed": { "$ref": "#/$defs/triggerFilterless" },
+            "review_vote.posted": { "$ref": "#/$defs/triggerFilterless" },
+            "ci.status_changed": { "$ref": "#/$defs/triggerFilterless" },
+            "issue.comment": { "$ref": "#/$defs/triggerCommentFilter" },
+            "commit.pushed": { "$ref": "#/$defs/triggerPushFilter" },
+            "patch.submitted": { "$ref": "#/$defs/triggerPushFilter" }
+          }
+        },
+        "permission": {
+          "type": "string",
+          "enum": ["read", "write"],
+          "description": "GitHub-style repo permission level, enforced server-side on the platform v1 REST API. `read` allows read-only endpoints (GET issue/comment/todo/contribution/mergeability/sessions); `write` additionally allows every mutation (comment, edit, merge, close, review, todo update, contribution apply/close/set_meta, release ops, attachment upload, session recover, issue create). Omitted defaults to `read` (fail-safe)."
+        },
+        "tools": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "description": "List of tool-rule names (from the team-level agents.yml `tools:` map) this role references. The role's platform-tool visibility is the union of the named rules' glob patterns; everything else is hidden from the LLM tool schema (agent-side). Local tools are never restricted. Omitted = no platform tools. The fine-grained capability knob on top of the coarse `permission` level."
+        },
+        "mcp": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "description": "MCP server whitelist. Each element names a server key from the repo-root .mcp.json. When absent or empty the role loads no MCP servers; when non-empty only the listed servers are loaded. Referencing a non-existent server causes the agent session to explicitly fail at startup."
+        },
+        "scope": {
+          "type": "object",
+          "properties": {
+            "paths": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          },
+          "description": "Soft path-glob hint injected into the role's prompt; not enforced by pre-receive."
+        },
+        "llm": { "$ref": "#/$defs/llm" }
+      }
+    },
+    "triggerFilterless": {
+      "description": "Filter block for triggers that take no parameters. Must be null or an empty mapping; any property is a misconfiguration.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "maxProperties": 0
+        }
+      ]
+    },
+    "issues": {
+      "type": "object",
+      "description": "Issue behaviour configuration. When omitted every switch uses its default (recommended).",
+      "properties": {
+        "delete_branch_on_merge": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, the issue branch is automatically deleted after a successful merge. Set false to keep merged branches for post-hoc inspection."
+        }
+      }
+    },
+    "silence": {
+      "type": "object",
+      "description": "Repository-level silence-schedule configuration. When omitted the repo has no scheduled silence windows and silence is purely manual (API-driven).",
+      "properties": {
+        "schedules": {
+          "type": "array",
+          "description": "Ordered list of cron-driven silence windows. All items are OR-combined: if any schedule is active the repo is silent. Empty list means no schedules (manual-only).",
+          "items": { "$ref": "#/$defs/silenceSchedule" }
+        }
+      }
+    },
+    "silenceSchedule": {
+      "type": "object",
+      "required": ["name", "cron", "duration"],
+      "description": "One cron-driven silence window. Declares when to enter silence (cron edge) and how long to stay silent (duration), in a given timezone.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "Human-readable label, unique within the schedules list. Also used as source_ref in the audit log."
+        },
+        "cron": {
+          "type": "string",
+          "minLength": 1,
+          "description": "robfig/cron standard 5-field expression (minute hour day-of-month month day-of-week) specifying when the silence window opens. Seconds are forced to 0 by the parser."
+        },
+        "duration": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Silence window length in time.ParseDuration format (e.g. '10h', '1h30m'). Must be positive. Used to derive expected_exit_at."
+        },
+        "timezone": {
+          "type": "string",
+          "description": "IANA timezone name like 'Asia/Shanghai'. Defaults to 'UTC' when empty or omitted. Invalid timezones cause a parse-time failure."
+        }
+      }
+    },
+    "reviewers": {
+      "type": "object",
+      "description": "Per-contribution review gate. A contribution branch (issue-<N>/<role>/<slug>) is matched against `rules` by its changed paths: it collects the union of reviewers from every rule whose globs match any changed file. When no rule matches, `fallback` reviews it. The required reviewers determine when the contribution leaves `pending` (every required reviewer has voted) and whether it becomes `approved` (all approve/abstain) or `rejected` (any reject). Omit this block to run no review gate. Reviewer wake-up is a separate concern, driven by each role's `commit.pushed` trigger.",
+      "required": ["fallback"],
+      "properties": {
+        "rules": {
+          "type": "array",
+          "description": "Ordered path-to-reviewers mappings. A contribution unions the reviewers of every rule it matches.",
+          "items": {
+            "type": "object",
+            "required": ["paths", "reviewers"],
+            "properties": {
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 },
+                "description": "Doublestar globs (GitHub Actions semantics) matched against a contribution's changed files. The rule matches if at least one changed file matches at least one pattern."
+              },
+              "reviewers": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,38}$"
+                },
+                "description": "Role keys that must review a contribution this rule matches. Each must name a role that exists AND can cast review votes (has issue_review_vote in its tool ACL). The Go parser enforces both cross-references; JSON Schema cannot."
+              }
+            }
+          }
+        },
+        "fallback": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,38}$"
+          },
+          "description": "Reviewer role(s) used only when no rule matches a contribution's changed paths (conventionally the maintainer). Required and non-empty whenever a `reviewers:` block is present, so a contribution can never be left with no possible reviewer. Same role-exists + can-vote constraints as rule reviewers."
+        }
+      }
+    },
+    "triggerCommentFilter": {
+      "description": "Filter block for `issue.comment`. All fields default to no-filter; AND-combined when set. Unknown keys are silently dropped, so a typo (e.g. `mention_only:` for `mentioned_only:`) parses cleanly but leaves the filter empty — diff against the canonical keys below if a trigger fires more or less often than expected.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "properties": {
+            "mentioned_only": {
+              "type": "boolean",
+              "description": "When true, the role fires only if its own key is in the comment's @agent-<key> mention list."
+            },
+            "from_roles": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]{0,38}$"
+              },
+              "description": "Fires only for comments posted by an agent whose role key is in this list."
+            },
+            "from_users": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Fires only for comments posted by a human user whose platform login is in this list."
+            }
+          }
+        }
+      ]
+    },
+    "triggerPushFilter": {
+      "description": "Filter block for `commit.pushed` and `patch.submitted`. AND-combined when both lists are set. Glob semantics mirror GitHub Actions / doublestar. For `patch.submitted` the globs match against the patch's changed_paths rather than git commit diffs. Unknown keys are silently dropped — see `triggerCommentFilter` for the same forward-compat note.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "properties": {
+            "paths": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Include globs. Push wakes the role only if at least one changed file matches at least one pattern."
+            },
+            "paths_ignore": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Ignore globs. Push wakes the role only if at least one changed file is NOT covered by these patterns (every-file-ignored push is skipped)."
+
+            }
+          }
+        }
+      ]
+    },
+    "platformTool": {
+      "type": "string",
+      "description": "Name of a platform tool exposed by the Hangrix agent runtime over the network-served agent v1 API. Used inside the top-level `tools:` rules of agents.yml: each rule is a list of glob patterns (`*` wildcard allowed) matched against these names; a role's visible platform tools = union of its referenced rules' patterns. Hidden from the LLM tool schema agent-side. **Local tools — read, write, edit, glob, grep, bash, bash_input, webfetch, sleep, compact_session — are baked into the agent binary, always available, and are NOT platform tools; never list them here.** The enum below is documentation only and is INTENTIONALLY not enforced by the JSON Schema `enum` keyword: the runtime catalogue ships with each agent release and may add new tools between schema bumps. Authoritative source: `apps/hangrix-agent/internal/tools/platform/platform.go` (the `All()` toolDef slice). When a runtime ships a new tool, this list lags by one schema revision — that is acceptable; an unknown tool name still parses, it just shows no editor hint.",
+      "examples": [
+        "issue_read",
+        "issue_comment_read",
+        "issue_mergeable",
+        "issue_todo_list",
+        "issue_children",
+        "issue_read_by_number",
+        "issue_checks",
+        "roster_list",
+        "contribution_list",
+        "contribution_read",
+        "issue_create",
+        "issue_comment",
+        "issue_comment_cross",
+        "issue_edit",
+        "issue_review_vote",
+        "issue_close",
+        "issue_merge",
+        "session_recover",
+        "issue_attachment_upload",
+        "issue_todo_update",
+        "contribution_set_meta",
+        "contribution_apply",
+        "contribution_close",
+        "release_create",
+        "release_upload_asset",
+        "release_publish",
+        "release_update",
+        "release_delete",
+        "ask_question",
+        "check_questionnaire",
+        "close_questionnaire"
+      ]
+    }
+  }
+}
