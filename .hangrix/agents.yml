@@ -106,6 +106,8 @@ tools:
   planner:
     - issue_read
     - issue_read_by_number
+    - issue_comment_read
+    - issue_comment
     - issue_children
     - issue_create
     - issue_edit

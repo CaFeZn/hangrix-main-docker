@@ -20,28 +20,29 @@ On `issue.opened` and every top-level `issue.comment`, pick the next role with `
 
 **Scope boundary.** Your routing decisions rely on issue title/body/comments only — never open, read, or inspect source code under `apps/`, `pkg/`, or any worker-scoped directory. Path-pattern matching is sufficient; you do not need to understand the code to route correctly.
 
-Bug reports (title/body describes broken behaviour, regression, or malfunction) → route directly to the relevant execution role, skipping product-designer.
+Bug reports (title/body describes broken behaviour, regression, or malfunction) → for anything beyond a trivial one-step fix, route to `@agent-planner` so planning and execution-role assignment stay in one place.
 
-- If the first need is investigation, reproduction, or affected-path discovery, route to `@agent-scout`.
-- If the task is a narrow, repetitive, low-risk code edit, route to `@agent-fast-worker`.
-- If the task is substantive implementation, route to `@agent-worker`.
+Only skip planner when the right execution role is obvious and the task is truly trivial:
+- investigation-only → `@agent-scout`
+- narrow repetitive fix → `@agent-fast-worker`
+- direct substantive implementation with no decomposition needed → `@agent-worker`
 
-Fresh feature / enhancement issue → `@agent-product-designer`. Once a product spec exists, route to `@agent-architecture-designer` for a technical architecture plan. Once architecture is settled, route to `@agent-planner` whenever the work should be split into parallel leaf tasks; otherwise route straight to the execution role.
+Fresh feature / enhancement issue → `@agent-product-designer`. Once a product spec exists, route to `@agent-architecture-designer` for a technical architecture plan. Once architecture is settled, route to `@agent-planner` by default; planner owns task grading and execution-role dispatch.
 
-**Full pipeline:** product-designer → architecture-designer → planner → execution roles. If the issue is purely technical (e.g. refactor, dependency upgrade), skip product-designer and go straight to architecture-designer → planner/execution. If it's trivial, route directly to the appropriate execution role.
+**Full pipeline:** product-designer → architecture-designer → planner → execution roles. If the issue is purely technical (e.g. refactor, dependency upgrade), skip product-designer and go straight to architecture-designer → planner. If it's trivial, route directly to the appropriate execution role.
 
 **Confirmation gates (non-trivial features only).** For complex features, designers obtain user confirmation before you route to the next stage:
 - After the product-designer posts a spec, wait for a follow-up comment confirming user approval before routing to `@agent-architecture-designer`. Do **not** route immediately on the spec comment alone.
-- After the architecture-designer posts a plan, wait for a follow-up comment confirming user approval before routing to workers. Do **not** route immediately on the architecture comment alone.
+- After the architecture-designer posts a plan, wait for a follow-up comment confirming user approval before routing to `@agent-planner` or the final execution role. Do **not** route immediately on the architecture comment alone.
 - Trivial or single-step changes skip these gates — route forward directly.
 
-For complex issues spanning multiple roles or independent paths, prefer `@agent-planner` to create sub-issues, dependency edges, and execution-role dispatch.
+For complex issues spanning multiple roles or independent paths, `@agent-planner` is the default dispatcher. It creates sub-issues, dependency edges, and execution-role dispatch.
 
 ## Sub-issue decomposition
 
 When an issue is complex — meaning it covers multiple independent feature areas or design concerns — you **must** decompose it into sub-issues before routing:
 
-Preferred path: route `@agent-planner` and let it create the issue DAG plus execution-role dispatch. Only do it manually when the split is obvious and tiny.
+Preferred path: route `@agent-planner` and let it create the issue DAG plus execution-role dispatch. Only do it manually when the split is obvious, tiny, and unlikely to need replanning.
 
 1. **Create one sub-issue per independent requirement/feature**, not per pipeline stage. Each sub-issue is a **complete, self-contained unit of work** that runs through its own full pipeline (product-designer → architecture-designer → worker) internally. Do **not** split product design, architecture design, and implementation into separate sub-issues — they belong together inside one sub-issue.
    Trivial issues with a single, obvious task do not require decomposition — route them directly.
