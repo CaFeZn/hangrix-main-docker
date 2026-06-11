@@ -25,6 +25,7 @@ Bug reports (title/body describes broken behaviour, regression, or malfunction) 
 Only skip planner when the right execution role is obvious and the task is truly trivial:
 - investigation-only → `@agent-scout`
 - narrow repetitive fix → `@agent-fast-worker`
+- long-context special-case implementation → `@agent-special-worker`
 - direct substantive implementation with no decomposition needed → `@agent-worker`
 
 Fresh feature / enhancement issue → `@agent-product-designer`. Once a product spec exists, route to `@agent-architecture-designer` for a technical architecture plan. Once architecture is settled, route to `@agent-planner` by default; planner owns task grading and execution-role dispatch.
@@ -82,7 +83,7 @@ After routing a new issue and planning the work, create todos via `issue_todo_up
 
 This is the issue→base gate. The issue branch starts empty (identical to base) and only fills as you `contribution_apply` approved branches into it — so **never `issue_merge` before contributions are applied**, or you ship an empty merge. The server blocks `issue_merge` while any contribution is still `pending` (its required reviewers haven't all voted) or the issue branch carries no changes; confirm readiness with `issue_mergeable` first.
 
-Before merging, call `roster_list` to confirm no active planning or execution roles remain (`planner`, `scout`, `fast-worker`, `worker`, `product-designer`, `architecture-designer`). Then verify: every contribution you intend to ship is `applied` (merged into the issue branch), no contribution is still `pending`, `issue_todo_list` reports `all_done: true`, AND `issue_checks` is green. You don't tally individual votes — the server computes each contribution's `approved` / `rejected` status from its required reviewers (the `reviewers:` block in agents.yml, matched by changed paths). Before `issue_merge`, also verify every sub-issue is merged or closed via `issue_children` (the server blocks otherwise with `code: "incomplete_sub_issues"`).
+Before merging, call `roster_list` to confirm no active planning or execution roles remain (`planner`, `scout`, `fast-worker`, `special-worker`, `worker`, `product-designer`, `architecture-designer`). Then verify: every contribution you intend to ship is `applied` (merged into the issue branch), no contribution is still `pending`, `issue_todo_list` reports `all_done: true`, AND `issue_checks` is green. You don't tally individual votes — the server computes each contribution's `approved` / `rejected` status from its required reviewers (the `reviewers:` block in agents.yml, matched by changed paths). Before `issue_merge`, also verify every sub-issue is merged or closed via `issue_children` (the server blocks otherwise with `code: "incomplete_sub_issues"`).
 
 Immediately before `issue_merge`, post one final `issue_comment` summarising the decision (`LGTM — merging` plus a one-line rationale). Then `issue_merge`, then `issue_close`.
 

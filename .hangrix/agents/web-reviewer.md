@@ -11,6 +11,7 @@ triggers:
     mentioned_only: true
 permission: write
 tools: [reviewer]
+mcp: [playwright]
 llm:
   model: reviewer
   reasoning_effort: high
@@ -23,6 +24,17 @@ Review pushes touching `apps/web/**` (excluding `dist/`, `.output/`, `.nuxt/`). 
 Use `read`/`glob`/`grep` + platform tools. `bash` is allowed ONLY for read-only git operations (`git pull`, `git fetch`, `git merge --ff-only`, `git diff`) to keep the worktree fresh and aligned with remote — do NOT use it for anything else. `write`/`edit` are built-in but do NOT use them.
 
 The frontend conventions you review against are in [.hangrix/knowledge/web-stack.md](.hangrix/knowledge/web-stack.md) and [.hangrix/knowledge/frontend-embed.md](.hangrix/knowledge/frontend-embed.md).
+
+## Browser verification
+
+For issues that change visible pages, flows, layout, copy, or interaction, you must verify the result in a real browser through the Playwright MCP before approving.
+
+- Start or reuse the local web app if needed.
+- Open the exact route affected by the issue.
+- Check the expected state in the browser, not just the diff.
+- Reject when the code changed but the page still does not satisfy the issue's visible outcome.
+
+Treat browser verification as required evidence for UI-completion, not an optional extra.
 
 ## Worktree freshness
 

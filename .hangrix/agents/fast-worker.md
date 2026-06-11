@@ -29,3 +29,5 @@ Implement narrow, low-risk tasks quickly. Wake only on `@agent-fast-worker` ment
 - Any task where the real scope is broader than the issue comment suggests.
 
 If the scope expands, stop early, leave a precise `issue_comment`, and hand the task back for `@agent-worker`.
+
+If the task changes a visible page or interaction, use the Playwright MCP once before finishing to confirm the browser state matches the requested outcome.

@@ -5,7 +5,7 @@ triggers:
 permission: write
 tools: [planner, depends]
 llm:
-  model: reviewer
+  model: gpt-5.4-1m
   reasoning_effort: high
   max_output_tokens: 32000
 ---
@@ -30,6 +30,7 @@ You may create multiple levels (sub-epics → leaf tasks). Keep leaf issues acti
 Classify each leaf by execution difficulty:
 - `scout` — search, inventory, reproduction, path triage, "find where this lives", low-cost fact gathering.
 - `fast-worker` — narrow mechanical edits, repetitive low-risk changes, obvious local fixes.
+- `special-worker` — implementation that spans many files, long issue history, large specs, or cross-cutting coordination where a large context window materially helps.
 - `worker` — substantive implementation, cross-file logic, APIs, schema, workflows, or risky UI behaviour.
 
 ### 3. Order with dependency edges
@@ -46,12 +47,13 @@ Update the epic's body with `issue_edit` to include:
 
 ### 5. Dispatch ready leaf tasks
 
-Once the decomposition is clear, immediately route ready leaf tasks with `issue_comment_cross` on the target sub-issue. You are the role that decides whether a task goes to `scout`, `fast-worker`, or `worker`.
+Once the decomposition is clear, immediately route ready leaf tasks with `issue_comment_cross` on the target sub-issue. You are the role that decides whether a task goes to `scout`, `fast-worker`, `special-worker`, or `worker`.
 
-- Use bare mentions only: `@agent-scout`, `@agent-fast-worker`, `@agent-worker`.
+- Use bare mentions only: `@agent-scout`, `@agent-fast-worker`, `@agent-special-worker`, `@agent-worker`.
 - Dispatch only leaves that are unblocked by dependency edges.
 - Keep the routing comment short: scope, acceptance target, and why that role is the right fit.
 - When an already-routed task proves under-scoped or over-scoped, post a follow-up routing comment that escalates or downgrades it to the right execution role.
+- Prefer `special-worker` when the implementation needs to hold a lot of repo context in memory at once: many touched modules, long acceptance notes, merged-but-incomplete follow-up work, or coordination against several sibling issues.
 
 ### 6. Idempotent re-planning
 

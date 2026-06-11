@@ -52,6 +52,7 @@ The stack, file layout, library conventions, and verification commands live in [
 Before submitting, build and test what you touched:
 - **Server/runtime**: run the test suite for the module(s) touched (commands in [.hangrix/knowledge/local-stack.md](.hangrix/knowledge/local-stack.md)). For runtime wire/loop changes, run a real session E2E (see [docs/runner-protocol.md](docs/runner-protocol.md)).
 - **Frontend**: typecheck always; build for routing/composable changes; drive the running dev server with Playwright `browser_*` tools for UI changes and confirm rendered output matches expectations.
+- **Frontend issue completion**: when the issue changes a visible page, route, copy, or interaction, use the Playwright MCP to open the affected page and confirm the issue's expected UI outcome is actually present before you stop.
 
 Push your contribution branch under your namespace, e.g. `issue-<n>/worker/add-rate-limit` (slug = the change; immutable-branch + review rules are in your runtime baseline).
 
