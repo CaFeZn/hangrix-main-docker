@@ -115,6 +115,10 @@ tools:
     - issue_todo_list
     - issue_todo_update
     - issue_depends_*
+    - project_read
+    - project_repo_link
+    - project_issue_link
+    - project_repo_proposal_create
     - issue_attachment_upload
     - roster_list
     - contribution_read

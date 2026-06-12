@@ -74,6 +74,14 @@ func RegisterV1Routes(r chi.Router, api AgentAPI) {
 	// Repo-scoped issue creation
 	r.Post("/repos/{repoID}/issues", v1CreateIssue(api))
 
+	// Project-level orchestration helpers.
+	r.Route("/projects/{projectID}", func(r chi.Router) {
+		r.Get("/", v1ReadProject(api))
+		r.Post("/repos", v1LinkProjectRepo(api))
+		r.Post("/issue-links", v1LinkProjectIssue(api))
+		r.Post("/repo-proposals", v1CreateProjectRepoProposal(api))
+	})
+
 	// LLM Models
 	r.Get("/models/{name}", v1GetModel(api))
 }

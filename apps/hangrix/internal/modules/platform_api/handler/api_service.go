@@ -79,6 +79,12 @@ type AgentAPI interface {
 	RemoveDependency(ctx context.Context, p *apidomain.Actor, dependsOnNumber int64) (any, error)
 	ReadDependencies(ctx context.Context, p *apidomain.Actor) (any, error)
 
+	// Projects
+	ReadProject(ctx context.Context, p *apidomain.Actor, projectID int64) (any, error)
+	LinkProjectRepo(ctx context.Context, p *apidomain.Actor, projectID, repoID int64, purpose, role string) (any, error)
+	LinkProjectIssue(ctx context.Context, p *apidomain.Actor, projectID, repoID, issueNumber int64, kind, summary string) (any, error)
+	CreateProjectRepoProposal(ctx context.Context, p *apidomain.Actor, projectID int64, ownerName, repoName, description, reason, moduleBoundary string) (any, error)
+
 	// LLM Models
 	GetModel(ctx context.Context, p *apidomain.Actor, name string) (any, error)
 }

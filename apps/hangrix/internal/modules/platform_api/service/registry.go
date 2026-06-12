@@ -17,12 +17,13 @@ import (
 
 	"github.com/hangrix/hangrix/apps/hangrix/internal/agentsconfig"
 	actordomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/actor/domain"
-	apidomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/platform_api/domain"
 	agentsessiondomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/agent_session/domain"
 	attachmentdomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/attachment/domain"
 	gitdomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/git/domain"
 	issuedomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/issue/domain"
 	llmproviderdomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/llm_provider/domain"
+	apidomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/platform_api/domain"
+	projectdomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/project/domain"
 	questionnairedomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/questionnaire/domain"
 	releasedomain "github.com/hangrix/hangrix/apps/hangrix/internal/modules/release/domain"
 	releaseinfra "github.com/hangrix/hangrix/apps/hangrix/internal/modules/release/infra"
@@ -41,27 +42,28 @@ type Registry struct {
 }
 
 type RegistryDeps struct {
-	Issues        issuedomain.Store
-	Contributions issuedomain.ContributionStore
-	Repos         repodomain.Store
-	Storage       repodomain.PathResolver
-	Git           gitdomain.Git
-	Runner        runnerdomain.Repo
-	Spawner       agentsessiondomain.Spawner
-	Archiver      agentsessiondomain.Archiver
-	Controller    agentsessiondomain.Controller
-	ActorResolver actordomain.Resolver
-	Protections   repodomain.ProtectionStore
-	Guards        []repodomain.BranchWriteGuard
-	Releases      releasedomain.Store
-	ReleaseAssets releasedomain.AssetStore
-	AssetStorage  *releaseinfra.AssetStorage
-	Attachments   attachmentdomain.Uploader
-	Todos         issuedomain.TodoStore
-	Deps          issuedomain.DependencyStore
+	Issues         issuedomain.Store
+	Contributions  issuedomain.ContributionStore
+	Repos          repodomain.Store
+	Storage        repodomain.PathResolver
+	Git            gitdomain.Git
+	Runner         runnerdomain.Repo
+	Spawner        agentsessiondomain.Spawner
+	Archiver       agentsessiondomain.Archiver
+	Controller     agentsessiondomain.Controller
+	ActorResolver  actordomain.Resolver
+	Protections    repodomain.ProtectionStore
+	Guards         []repodomain.BranchWriteGuard
+	Releases       releasedomain.Store
+	ReleaseAssets  releasedomain.AssetStore
+	AssetStorage   *releaseinfra.AssetStorage
+	Attachments    attachmentdomain.Uploader
+	Todos          issuedomain.TodoStore
+	Deps           issuedomain.DependencyStore
 	Questionnaires questionnairedomain.Service
-	CheckReader   workflowdomain.CheckReader
-	LLMLookup     llmproviderdomain.Lookup
+	CheckReader    workflowdomain.CheckReader
+	LLMLookup      llmproviderdomain.Lookup
+	Projects       projectdomain.Store
 }
 
 // NewRegistry constructs the business-logic core, capturing the shared

@@ -355,10 +355,10 @@ type Tool struct {
 	schema      map[string]any
 	client      *Client
 
-	method      string
-	buildPath   func(json.RawMessage) (string, error)
-	buildQuery  func(json.RawMessage) string
-	expect204   bool
+	method     string
+	buildPath  func(json.RawMessage) (string, error)
+	buildQuery func(json.RawMessage) string
+	expect204  bool
 }
 
 func (t *Tool) Name() string           { return t.name }
@@ -897,6 +897,10 @@ func All(client *Client, async local.AsyncLifecycle, readOnly bool) []local.Tool
 		{name: "issue_deps_read", description: "Read the current issue's dependency edges. Returns depends_on (outgoing edges — issues this one depends on), blocked_by (incoming edges from unresolved issues that block this one), and blocks (outgoing edges to issues this one blocks). The full neighbourhood is returned in one call so the agent does not need extra lookups.",
 			kind: "get", path: "/issues/current/dependencies",
 		},
+		{name: "project_read", description: "Read a project-level orchestration space by project_id. The current repo must already be linked to the project. Returns project metadata, linked repos, cross-repo issue links, and repo provisioning proposals.",
+			kind: "get", path: "/projects/{project_id}", pathParams: []string{"project_id"},
+			schema: objectSchema(map[string]any{"project_id": intProp("The project ID to read. The current repo must already be linked to that project.")}, []string{"project_id"}),
+		},
 		{name: "roster_list", description: "List every active role session on the current issue. Each item includes a `last_activity_at` field showing the most recent activity timestamp for that session — use it to detect stalled agents.",
 			kind: "get", path: "/issues/current/sessions",
 		},
@@ -912,11 +916,11 @@ func All(client *Client, async local.AsyncLifecycle, readOnly bool) []local.Tool
 			schema: objectSchema(map[string]any{"id": intProp("Contribution id to read (from contribution_list).")}, []string{"id"}),
 		},
 		{name: "workflow_list_runs", description: "List all workflow runs (and their jobs) attached to a given commit SHA in the current repo. Use this when a checker shows up failed in contribution_read / issue_read and you want to inspect which run/job failed. Each item carries a run summary + the jobs it spawned. The job_run_id from any returned job can be fed to workflow_download_job_log to fetch its full log to a local file.",
-			kind: "workflow_list_runs",
+			kind:   "workflow_list_runs",
 			schema: objectSchema(map[string]any{"commit_sha": stringProp("Full 40-char git commit SHA (from a contribution's head_sha or an issue's head_sha). Required.")}, []string{"commit_sha"}),
 		},
 		{name: "workflow_download_job_log", description: "Download the full log of a single workflow job to a local text file inside the agent container at /tmp/hangrix-logs/job-<id>.txt and return that path along with the byte count. Use it after workflow_list_runs surfaces a failed job. Each call overwrites the file. After it returns, read the file with the `read` tool (or `bash` / `grep`) to inspect errors.",
-			kind: "workflow_log",
+			kind:   "workflow_log",
 			schema: objectSchema(map[string]any{"job_run_id": intProp("The job_run_id from workflow_list_runs (also exposed as 'job_run_id' on each checker in contribution_read / issue_read).")}, []string{"job_run_id"}),
 		},
 
@@ -1031,6 +1035,36 @@ func All(client *Client, async local.AsyncLifecycle, readOnly bool) []local.Tool
 			schema: objectSchema(map[string]any{
 				"depends_on_number": intProp("Issue number to remove from the current issue's depends_on list (required). The dependency must exist."),
 			}, []string{"depends_on_number"}),
+		},
+		{name: "project_repo_link", description: "Link an existing repository to a project-level orchestration space. Use when planner decides an existing repo belongs to this project. The current repo must already be linked to the project.",
+			kind: "post", path: "/projects/{project_id}/repos", pathParams: []string{"project_id"}, write: true,
+			schema: objectSchema(map[string]any{
+				"project_id": intProp("The project ID."),
+				"repo_id":    intProp("The existing Hangrix repo ID to link."),
+				"purpose":    stringProp("Short purpose of this repo in the project."),
+				"role":       stringProp("Short role label such as core, runtime, ui, firmware, docs, or integration."),
+			}, []string{"project_id", "repo_id"}),
+		},
+		{name: "project_issue_link", description: "Track an issue from any linked project repository on the project dashboard. Use after creating or discovering implementation issues in project repos. The current repo must already be linked to the project.",
+			kind: "post", path: "/projects/{project_id}/issue-links", pathParams: []string{"project_id"}, write: true,
+			schema: objectSchema(map[string]any{
+				"project_id":   intProp("The project ID."),
+				"repo_id":      intProp("The target repo ID containing the issue."),
+				"issue_number": intProp("The target issue number in that repo."),
+				"kind":         stringProp("Link kind, e.g. implementation, planning, review, integration. Defaults to implementation."),
+				"summary":      stringProp("Optional project-level summary for why this issue matters."),
+			}, []string{"project_id", "repo_id", "issue_number"}),
+		},
+		{name: "project_repo_proposal_create", description: "Propose a new repository for a project when planner decides a requirement should become a separate module. This does not create the repo; it records a reviewable provisioning proposal.",
+			kind: "post", path: "/projects/{project_id}/repo-proposals", pathParams: []string{"project_id"}, write: true,
+			schema: objectSchema(map[string]any{
+				"project_id":      intProp("The project ID."),
+				"owner_name":      stringProp("Target owner namespace. Omit to default to the current repo owner."),
+				"repo_name":       stringProp("Proposed repository name."),
+				"description":     stringProp("Short repository description."),
+				"reason":          stringProp("Why this should be its own repository instead of work in an existing repo."),
+				"module_boundary": stringProp("Expected ownership boundary, public interfaces, and dependencies."),
+			}, []string{"project_id", "repo_name"}),
 		},
 		{name: "release_create", description: "Create a new release in draft state from an existing git tag. The tag must already exist in the repo.",
 			kind: "post", path: "/releases", write: true,
@@ -1246,7 +1280,7 @@ func issueEditSchema() map[string]any {
 
 func askQuestionSchema() map[string]any {
 	return map[string]any{
-		"type": "object",
+		"type":     "object",
 		"required": []string{"title", "questions"},
 		"properties": map[string]any{
 			"title": map[string]any{
@@ -1266,7 +1300,7 @@ func askQuestionSchema() map[string]any {
 				"minItems":    1,
 				"maxItems":    20,
 				"items": map[string]any{
-					"type": "object",
+					"type":     "object",
 					"required": []string{"type", "text"},
 					"properties": map[string]any{
 						"type": map[string]any{
@@ -1291,7 +1325,7 @@ func askQuestionSchema() map[string]any {
 							"minItems":    2,
 							"maxItems":    10,
 							"items": map[string]any{
-								"type": "object",
+								"type":     "object",
 								"required": []string{"label"},
 								"properties": map[string]any{
 									"label": map[string]any{

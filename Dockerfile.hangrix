@@ -1,10 +1,48 @@
+FROM node:22-alpine AS web-build
+
+RUN apk add --no-cache g++ make python3
+
+WORKDIR /src
+
+COPY . .
+
+RUN corepack enable \
+  && pnpm install --frozen-lockfile \
+  && pnpm --filter web generate \
+  && node apps/hangrix/scripts/copy-web-dist.mjs
+
+FROM golang:1.26 AS go-build
+
+WORKDIR /src
+
+COPY . .
+COPY --from=web-build /src/apps/hangrix/internal/web/dist ./apps/hangrix/internal/web/dist
+
+RUN mkdir -p apps/hangrix-runner/internal/agentbin/payload \
+    apps/hangrix/internal/modules/runner/binaries/payload \
+    /out \
+  && rm -f apps/hangrix/internal/modules/runner/binaries/payload/hangrix-runner \
+    apps/hangrix/internal/modules/runner/binaries/payload/hangrix-agent \
+    apps/hangrix/internal/modules/runner/binaries/payload/hangrix-runner_* \
+    apps/hangrix-runner/internal/agentbin/payload/hangrix-agent \
+  && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+    -o apps/hangrix-runner/internal/agentbin/payload/hangrix-agent \
+    ./apps/hangrix-agent/cmd/hangrix-agent \
+  && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+    -o apps/hangrix/internal/modules/runner/binaries/payload/hangrix-runner_linux_amd64 \
+    ./apps/hangrix-runner/cmd/hangrix-runner \
+  && rm -f apps/hangrix-runner/internal/agentbin/payload/hangrix-agent \
+  && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+    -o /out/hangrix \
+    ./apps/hangrix/cmd/hangrix
+
 FROM postgres:17-alpine
 
 RUN apk add --no-cache git openssh-client tzdata
 
 WORKDIR /app
 
-COPY dist/hangrix_linux_amd64 /usr/local/bin/hangrix
+COPY --from=go-build /out/hangrix /usr/local/bin/hangrix
 COPY apps/hangrix/conf/config.yaml /app/config.yaml
 
 RUN chmod +x /usr/local/bin/hangrix \

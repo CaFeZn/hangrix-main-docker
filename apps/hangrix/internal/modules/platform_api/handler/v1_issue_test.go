@@ -19,7 +19,9 @@ type stubAgentAPI struct {
 	createComment func(ctx context.Context, p *apidomain.Actor, body, filePath string, line int) (any, error)
 }
 
-func (s *stubAgentAPI) ReadIssue(ctx context.Context, p *apidomain.Actor) (any, error)             { panic("unexpected") }
+func (s *stubAgentAPI) ReadIssue(ctx context.Context, p *apidomain.Actor) (any, error) {
+	panic("unexpected")
+}
 func (s *stubAgentAPI) EditIssue(ctx context.Context, p *apidomain.Actor, title, body *string) (any, error) {
 	panic("unexpected")
 }
@@ -41,9 +43,15 @@ func (s *stubAgentAPI) CreateCrossIssueComment(ctx context.Context, p *apidomain
 func (s *stubAgentAPI) GetComment(ctx context.Context, p *apidomain.Actor, id int64) (any, error) {
 	panic("unexpected")
 }
-func (s *stubAgentAPI) ListChildren(ctx context.Context, p *apidomain.Actor) (any, error)         { panic("unexpected") }
-func (s *stubAgentAPI) ListChecks(ctx context.Context, p *apidomain.Actor) (any, error)           { panic("unexpected") }
-func (s *stubAgentAPI) ListTodos(ctx context.Context, p *apidomain.Actor) (any, error)            { panic("unexpected") }
+func (s *stubAgentAPI) ListChildren(ctx context.Context, p *apidomain.Actor) (any, error) {
+	panic("unexpected")
+}
+func (s *stubAgentAPI) ListChecks(ctx context.Context, p *apidomain.Actor) (any, error) {
+	panic("unexpected")
+}
+func (s *stubAgentAPI) ListTodos(ctx context.Context, p *apidomain.Actor) (any, error) {
+	panic("unexpected")
+}
 func (s *stubAgentAPI) CreateTodo(ctx context.Context, p *apidomain.Actor, content, status string, position int) (any, error) {
 	panic("unexpected")
 }
@@ -68,28 +76,36 @@ func (s *stubAgentAPI) CloseContribution(ctx context.Context, p *apidomain.Actor
 func (s *stubAgentAPI) CreateReview(ctx context.Context, p *apidomain.Actor, contributionID int64, value, reason string) (any, error) {
 	panic("unexpected")
 }
-func (s *stubAgentAPI) GetMergeability(ctx context.Context, p *apidomain.Actor) (any, error)  { panic("unexpected") }
+func (s *stubAgentAPI) GetMergeability(ctx context.Context, p *apidomain.Actor) (any, error) {
+	panic("unexpected")
+}
 func (s *stubAgentAPI) MergeIssue(ctx context.Context, p *apidomain.Actor, message string) (any, error) {
 	panic("unexpected")
 }
 func (s *stubAgentAPI) CloseIssue(ctx context.Context, p *apidomain.Actor, reason string) (any, error) {
 	panic("unexpected")
 }
-func (s *stubAgentAPI) ListSessions(ctx context.Context, p *apidomain.Actor) (any, error)      { panic("unexpected") }
+func (s *stubAgentAPI) ListSessions(ctx context.Context, p *apidomain.Actor) (any, error) {
+	panic("unexpected")
+}
 func (s *stubAgentAPI) RecoverSession(ctx context.Context, p *apidomain.Actor, sessionID int64) (any, error) {
 	panic("unexpected")
 }
 func (s *stubAgentAPI) UploadAttachment(ctx context.Context, p *apidomain.Actor, data []byte, name, displayName string, inline bool, commentID int64) (any, error) {
 	panic("unexpected")
 }
-func (s *stubAgentAPI) GetMe(ctx context.Context, p *apidomain.Actor) (any, error) { panic("unexpected") }
+func (s *stubAgentAPI) GetMe(ctx context.Context, p *apidomain.Actor) (any, error) {
+	panic("unexpected")
+}
 func (s *stubAgentAPI) CreateRelease(ctx context.Context, p *apidomain.Actor, tagName, title, notes string) (any, error) {
 	panic("unexpected")
 }
 func (s *stubAgentAPI) UpdateRelease(ctx context.Context, p *apidomain.Actor, id int64, tagName, title, notes *string) (any, error) {
 	panic("unexpected")
 }
-func (s *stubAgentAPI) DeleteRelease(ctx context.Context, p *apidomain.Actor, id int64) error { panic("unexpected") }
+func (s *stubAgentAPI) DeleteRelease(ctx context.Context, p *apidomain.Actor, id int64) error {
+	panic("unexpected")
+}
 func (s *stubAgentAPI) PublishRelease(ctx context.Context, p *apidomain.Actor, id int64) (any, error) {
 	panic("unexpected")
 }
@@ -118,6 +134,18 @@ func (s *stubAgentAPI) RemoveDependency(ctx context.Context, p *apidomain.Actor,
 	panic("unexpected")
 }
 func (s *stubAgentAPI) ReadDependencies(ctx context.Context, p *apidomain.Actor) (any, error) {
+	panic("unexpected")
+}
+func (s *stubAgentAPI) ReadProject(ctx context.Context, p *apidomain.Actor, projectID int64) (any, error) {
+	panic("unexpected")
+}
+func (s *stubAgentAPI) LinkProjectRepo(ctx context.Context, p *apidomain.Actor, projectID, repoID int64, purpose, role string) (any, error) {
+	panic("unexpected")
+}
+func (s *stubAgentAPI) LinkProjectIssue(ctx context.Context, p *apidomain.Actor, projectID, repoID, issueNumber int64, kind, summary string) (any, error) {
+	panic("unexpected")
+}
+func (s *stubAgentAPI) CreateProjectRepoProposal(ctx context.Context, p *apidomain.Actor, projectID int64, ownerName, repoName, description, reason, moduleBoundary string) (any, error) {
 	panic("unexpected")
 }
 

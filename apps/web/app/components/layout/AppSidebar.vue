@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
-import { Building2, FolderGit2, GitBranch, LayoutDashboard, LogOut, Plus, Settings, Shield, User } from 'lucide-vue-next'
+import { Boxes, Building2, FolderGit2, GitBranch, LayoutDashboard, LogOut, Plus, Settings, Shield, User } from 'lucide-vue-next'
 import {
   Sidebar,
   SidebarContent,
@@ -48,6 +48,7 @@ async function onLogout() {
 
 const workspaceItems = computed<NavItem[]>(() => [
   { key: 'dashboard', to: '/', icon: LayoutDashboard, label: t('nav.dashboard') },
+  { key: 'projects', to: '/projects', icon: Boxes, label: 'Projects' },
   { key: 'repos', to: '/repos', icon: FolderGit2, label: t('nav.repos') },
 ])
 
