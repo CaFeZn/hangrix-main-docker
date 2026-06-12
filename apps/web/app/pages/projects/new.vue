@@ -15,11 +15,13 @@ import {
 } from '@/components/ui/select'
 import type { Project } from '~/types/project'
 
+const { t } = useI18n()
+
 setBreadcrumbs(() => [
-  { label: 'Projects', to: '/projects' },
-  { label: 'New project' },
+  { label: t('project.title'), to: '/projects' },
+  { label: t('project.create') },
 ])
-useHead({ title: 'New project - Hangrix' })
+useHead({ title: () => `${t('project.createTitle')} - ${t('app.name')}` })
 
 const router = useRouter()
 const { user, refresh: refreshUser } = useCurrentUser()
@@ -27,7 +29,7 @@ const { orgs, refresh: refreshOrgs } = useMyOrgs()
 
 const SELF = '__self__'
 const ownerOptions = computed(() => [
-  { value: SELF, label: user.value?.username ? `@${user.value.username}` : 'Me' },
+  { value: SELF, label: user.value?.username ? `@${user.value.username}` : t('project.ownerSelfFallback') },
   ...((orgs.value ?? []).map(o => ({ value: o.name, label: o.name }))),
 ])
 
@@ -55,7 +57,7 @@ async function submit() {
     })
     router.push(`/projects/${project.owner_name}/${project.name}`)
   } catch (e: any) {
-    error.value = e?.data?.error ?? 'Failed to create project'
+    error.value = e?.data?.error ?? t('project.createFailed')
   } finally {
     submitting.value = false
   }
@@ -70,21 +72,21 @@ onMounted(async () => {
 <template>
   <div class="mx-auto w-full max-w-4xl space-y-6">
     <header class="space-y-1">
-      <h1 class="text-2xl font-semibold tracking-tight">New project</h1>
+      <h1 class="text-2xl font-semibold tracking-tight">{{ t('project.createTitle') }}</h1>
       <p class="text-sm text-muted-foreground">
-        Create a project space that can coordinate multiple repositories.
+        {{ t('project.createSubtitle') }}
       </p>
     </header>
 
     <Card>
       <form @submit.prevent="submit">
         <CardHeader>
-          <CardTitle>Project</CardTitle>
-          <CardDescription>Use this for xrobot-style top-level planning.</CardDescription>
+          <CardTitle>{{ t('project.cardTitle') }}</CardTitle>
+          <CardDescription>{{ t('project.cardDescription') }}</CardDescription>
         </CardHeader>
         <CardContent class="space-y-4">
           <div class="space-y-2">
-            <Label>Owner</Label>
+            <Label>{{ t('project.owner') }}</Label>
             <Select v-model="form.owner">
               <SelectTrigger class="w-full">
                 <SelectValue />
@@ -98,42 +100,42 @@ onMounted(async () => {
           </div>
 
           <div class="space-y-2">
-            <Label for="project-name">Name</Label>
+            <Label for="project-name">{{ t('project.name') }}</Label>
             <Input id="project-name" v-model="form.name" autocomplete="off" required pattern="[A-Za-z0-9_.-]+" />
           </div>
 
           <div class="space-y-2">
-            <Label for="project-description">Description</Label>
+            <Label for="project-description">{{ t('project.description') }}</Label>
             <Input id="project-description" v-model="form.description" autocomplete="off" />
           </div>
 
           <div class="space-y-3">
-            <Label>Visibility</Label>
+            <Label>{{ t('project.visibility') }}</Label>
             <RadioGroup v-model="form.visibility" class="grid gap-3 sm:grid-cols-2">
               <div class="flex items-start gap-3 rounded-md border p-3">
                 <RadioGroupItem id="project-private" value="private" class="mt-1" />
                 <div>
-                  <Label for="project-private" class="text-sm font-medium">Private</Label>
-                  <p class="text-xs text-muted-foreground">Only owners and members can read it.</p>
+                  <Label for="project-private" class="text-sm font-medium">{{ t('project.visibilityPrivate') }}</Label>
+                  <p class="text-xs text-muted-foreground">{{ t('project.visibilityPrivateHint') }}</p>
                 </div>
               </div>
               <div class="flex items-start gap-3 rounded-md border p-3">
                 <RadioGroupItem id="project-public" value="public" class="mt-1" />
                 <div>
-                  <Label for="project-public" class="text-sm font-medium">Public</Label>
-                  <p class="text-xs text-muted-foreground">Visible to signed-in users.</p>
+                  <Label for="project-public" class="text-sm font-medium">{{ t('project.visibilityPublic') }}</Label>
+                  <p class="text-xs text-muted-foreground">{{ t('project.visibilityPublicHint') }}</p>
                 </div>
               </div>
             </RadioGroup>
           </div>
 
           <div class="space-y-2">
-            <Label for="project-architecture">Architecture</Label>
+            <Label for="project-architecture">{{ t('project.architecture') }}</Label>
             <Textarea id="project-architecture" v-model="form.architecture" rows="6" />
           </div>
 
           <div class="space-y-2">
-            <Label for="project-boundaries">Module boundaries</Label>
+            <Label for="project-boundaries">{{ t('project.moduleBoundaries') }}</Label>
             <Textarea id="project-boundaries" v-model="form.module_boundaries" rows="6" />
           </div>
 
@@ -141,10 +143,10 @@ onMounted(async () => {
         </CardContent>
         <CardFooter class="justify-end gap-2">
           <Button variant="outline" type="button" as-child>
-            <NuxtLink to="/projects">Cancel</NuxtLink>
+            <NuxtLink to="/projects">{{ t('common.cancel') }}</NuxtLink>
           </Button>
           <Button type="submit" :disabled="submitting">
-            {{ submitting ? 'Creating...' : 'Create project' }}
+            {{ submitting ? t('project.submitting') : t('project.submit') }}
           </Button>
         </CardFooter>
       </form>

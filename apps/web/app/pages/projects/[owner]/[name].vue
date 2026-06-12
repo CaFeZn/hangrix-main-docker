@@ -9,12 +9,13 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import type { Project } from '~/types/project'
 
+const { t } = useI18n()
 const route = useRoute()
 const owner = computed(() => String(route.params.owner))
 const name = computed(() => String(route.params.name))
 
 setBreadcrumbs(() => [
-  { label: 'Projects', to: '/projects' },
+  { label: t('project.title'), to: '/projects' },
   { label: `${owner.value}/${name.value}` },
 ])
 useHead({ title: () => `${owner.value}/${name.value} - Hangrix` })
@@ -36,7 +37,7 @@ async function load() {
     if (!repoForm.value.owner) repoForm.value.owner = project.value.owner_name
     if (!proposalForm.value.owner_name) proposalForm.value.owner_name = project.value.owner_name
   } catch (e: any) {
-    error.value = e?.data?.error ?? 'Failed to load project'
+    error.value = e?.data?.error ?? t('project.loadFailed')
   } finally {
     loading.value = false
   }
@@ -54,7 +55,7 @@ async function addRepo() {
     repoForm.value = { owner: project.value?.owner_name ?? '', name: '', purpose: '', role: '' }
     await load()
   } catch (e: any) {
-    actionError.value = e?.data?.error ?? 'Failed to link repo'
+    actionError.value = e?.data?.error ?? t('project.linkRepoFailed')
   }
 }
 
@@ -77,7 +78,7 @@ async function linkIssue() {
     issueForm.value = { owner: '', name: '', issue_number: '', kind: 'implementation', summary: '' }
     await load()
   } catch (e: any) {
-    actionError.value = e?.data?.error ?? 'Failed to link issue'
+    actionError.value = e?.data?.error ?? t('project.linkIssueFailed')
   }
 }
 
@@ -93,8 +94,44 @@ async function createProposal() {
     proposalForm.value = { owner_name: project.value?.owner_name ?? '', repo_name: '', description: '', reason: '', module_boundary: '' }
     await load()
   } catch (e: any) {
-    actionError.value = e?.data?.error ?? 'Failed to create proposal'
+    actionError.value = e?.data?.error ?? t('project.proposalFailed')
   }
+}
+
+function visibilityLabel(value: string) {
+  return value === 'public' ? t('project.visibilityPublic') : t('project.visibilityPrivate')
+}
+
+function issueStateLabel(value: string) {
+  switch (value) {
+    case 'open':
+      return t('project.issueStateOpen')
+    case 'closed':
+      return t('project.issueStateClosed')
+    case 'merged':
+      return t('project.issueStateMerged')
+    default:
+      return value || t('project.unknown')
+  }
+}
+
+function proposalStatusLabel(value: string) {
+  switch (value) {
+    case 'pending':
+      return t('project.proposalStatusPending')
+    case 'approved':
+      return t('project.proposalStatusApproved')
+    case 'rejected':
+      return t('project.proposalStatusRejected')
+    case 'provisioned':
+      return t('project.proposalStatusProvisioned')
+    default:
+      return value || t('project.unknown')
+  }
+}
+
+function issueKindLabel(value: string) {
+  return value === 'implementation' ? t('project.issueKindImplementation') : value
 }
 
 onMounted(load)
@@ -109,22 +146,22 @@ onMounted(load)
             {{ owner }} / {{ name }}
           </h1>
           <Badge v-if="project" :variant="project.visibility === 'private' ? 'outline' : 'secondary'">
-            {{ project.visibility }}
+            {{ visibilityLabel(project.visibility) }}
           </Badge>
         </div>
         <p class="text-sm text-muted-foreground">
-          {{ project?.description || 'Multi-repo project space' }}
+          {{ project?.description || t('project.detailFallback') }}
         </p>
       </div>
       <Button variant="outline" as-child>
         <NuxtLink to="/projects">
-          Projects
+          {{ t('project.title') }}
         </NuxtLink>
       </Button>
     </header>
 
     <p v-if="error" class="text-sm text-destructive">{{ error }}</p>
-    <p v-if="loading && !project" class="text-sm text-muted-foreground">Loading...</p>
+    <p v-if="loading && !project" class="text-sm text-muted-foreground">{{ t('common.loading') }}</p>
 
     <template v-if="project">
       <section class="grid gap-4 lg:grid-cols-2">
@@ -132,22 +169,22 @@ onMounted(load)
           <CardHeader>
             <CardTitle class="flex items-center gap-2 text-base">
               <Boxes class="size-4" />
-              Architecture
+              {{ t('project.architecture') }}
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <pre class="whitespace-pre-wrap text-sm text-muted-foreground">{{ project.architecture || 'No architecture notes yet.' }}</pre>
+            <pre class="whitespace-pre-wrap text-sm text-muted-foreground">{{ project.architecture || t('project.noArchitecture') }}</pre>
           </CardContent>
         </Card>
         <Card>
           <CardHeader>
             <CardTitle class="flex items-center gap-2 text-base">
               <GitBranch class="size-4" />
-              Module boundaries
+              {{ t('project.moduleBoundaries') }}
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <pre class="whitespace-pre-wrap text-sm text-muted-foreground">{{ project.module_boundaries || 'No module boundaries yet.' }}</pre>
+            <pre class="whitespace-pre-wrap text-sm text-muted-foreground">{{ project.module_boundaries || t('project.noModuleBoundaries') }}</pre>
           </CardContent>
         </Card>
       </section>
@@ -159,9 +196,9 @@ onMounted(load)
           <CardHeader>
             <CardTitle class="flex items-center gap-2 text-base">
               <GitBranch class="size-4" />
-              Repositories
+              {{ t('project.repositories') }}
             </CardTitle>
-            <CardDescription>{{ project.repos?.length ?? 0 }} linked repositories</CardDescription>
+            <CardDescription>{{ t('project.linkedRepositories', { n: project.repos?.length ?? 0 }) }}</CardDescription>
           </CardHeader>
           <CardContent class="space-y-3">
             <div v-for="r in project.repos" :key="r.id" class="flex items-center justify-between gap-3 rounded-md border p-3">
@@ -169,10 +206,10 @@ onMounted(load)
                 <NuxtLink :to="`/${r.owner_name}/${r.repo_name}`" class="truncate font-medium hover:underline">
                   {{ r.owner_name }} / {{ r.repo_name }}
                 </NuxtLink>
-                <p class="truncate text-xs text-muted-foreground">{{ r.role || 'repo' }} · {{ r.purpose || 'No purpose set' }}</p>
+                <p class="truncate text-xs text-muted-foreground">{{ r.role || t('project.repoFallback') }} · {{ r.purpose || t('project.noPurpose') }}</p>
               </div>
             </div>
-            <p v-if="!project.repos?.length" class="text-sm text-muted-foreground">No repositories linked.</p>
+            <p v-if="!project.repos?.length" class="text-sm text-muted-foreground">{{ t('project.noRepositories') }}</p>
           </CardContent>
         </Card>
 
@@ -180,30 +217,30 @@ onMounted(load)
           <CardHeader>
             <CardTitle class="flex items-center gap-2 text-base">
               <Plus class="size-4" />
-              Link repo
+              {{ t('project.linkRepo') }}
             </CardTitle>
           </CardHeader>
           <CardContent>
             <form class="space-y-3" @submit.prevent="addRepo">
               <div class="grid grid-cols-2 gap-2">
                 <div class="space-y-1">
-                  <Label>Owner</Label>
+                  <Label>{{ t('project.owner') }}</Label>
                   <Input v-model="repoForm.owner" />
                 </div>
                 <div class="space-y-1">
-                  <Label>Repo</Label>
+                  <Label>{{ t('project.repo') }}</Label>
                   <Input v-model="repoForm.name" />
                 </div>
               </div>
               <div class="space-y-1">
-                <Label>Role</Label>
-                <Input v-model="repoForm.role" placeholder="core, runtime, ui..." />
+                <Label>{{ t('project.role') }}</Label>
+                <Input v-model="repoForm.role" :placeholder="t('project.rolePlaceholder')" />
               </div>
               <div class="space-y-1">
-                <Label>Purpose</Label>
+                <Label>{{ t('project.purpose') }}</Label>
                 <Input v-model="repoForm.purpose" />
               </div>
-              <Button type="submit" class="w-full">Link</Button>
+              <Button type="submit" class="w-full">{{ t('project.link') }}</Button>
             </form>
           </CardContent>
         </Card>
@@ -214,9 +251,9 @@ onMounted(load)
           <CardHeader>
             <CardTitle class="flex items-center gap-2 text-base">
               <GitPullRequestArrow class="size-4" />
-              Cross-repo issues
+              {{ t('project.crossRepoIssues') }}
             </CardTitle>
-            <CardDescription>{{ project.issue_links?.length ?? 0 }} tracked tasks</CardDescription>
+            <CardDescription>{{ t('project.trackedTasks', { n: project.issue_links?.length ?? 0 }) }}</CardDescription>
           </CardHeader>
           <CardContent class="space-y-3">
             <div v-for="i in project.issue_links" :key="i.id" class="flex items-center justify-between gap-3 rounded-md border p-3">
@@ -224,28 +261,28 @@ onMounted(load)
                 <NuxtLink :to="`/${i.owner_name}/${i.repo_name}/issues/${i.issue_number}`" class="truncate font-medium hover:underline">
                   {{ i.owner_name }} / {{ i.repo_name }} #{{ i.issue_number }}
                 </NuxtLink>
-                <p class="truncate text-xs text-muted-foreground">{{ i.kind }} · {{ i.issue_title }}</p>
+                <p class="truncate text-xs text-muted-foreground">{{ issueKindLabel(i.kind) }} · {{ i.issue_title }}</p>
               </div>
-              <Badge :variant="i.issue_state === 'open' ? 'secondary' : 'outline'">{{ i.issue_state }}</Badge>
+              <Badge :variant="i.issue_state === 'open' ? 'secondary' : 'outline'">{{ issueStateLabel(i.issue_state) }}</Badge>
             </div>
-            <p v-if="!project.issue_links?.length" class="text-sm text-muted-foreground">No linked issues.</p>
+            <p v-if="!project.issue_links?.length" class="text-sm text-muted-foreground">{{ t('project.noIssueLinks') }}</p>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader>
-            <CardTitle class="text-base">Link issue</CardTitle>
+            <CardTitle class="text-base">{{ t('project.linkIssue') }}</CardTitle>
           </CardHeader>
           <CardContent>
             <form class="space-y-3" @submit.prevent="linkIssue">
               <div class="grid grid-cols-2 gap-2">
-                <Input v-model="issueForm.owner" placeholder="owner" />
-                <Input v-model="issueForm.name" placeholder="repo" />
+                <Input v-model="issueForm.owner" :placeholder="t('project.owner')" />
+                <Input v-model="issueForm.name" :placeholder="t('project.repo')" />
               </div>
-              <Input v-model="issueForm.issue_number" type="number" min="1" placeholder="issue number" />
-              <Input v-model="issueForm.kind" placeholder="kind" />
-              <Input v-model="issueForm.summary" placeholder="summary" />
-              <Button type="submit" class="w-full">Track</Button>
+              <Input v-model="issueForm.issue_number" type="number" min="1" :placeholder="t('project.issueNumber')" />
+              <Input v-model="issueForm.kind" :placeholder="t('project.kind')" />
+              <Input v-model="issueForm.summary" :placeholder="t('project.summary')" />
+              <Button type="submit" class="w-full">{{ t('project.track') }}</Button>
             </form>
           </CardContent>
         </Card>
@@ -256,37 +293,37 @@ onMounted(load)
           <CardHeader>
             <CardTitle class="flex items-center gap-2 text-base">
               <Lightbulb class="size-4" />
-              Repository proposals
+              {{ t('project.repositoryProposals') }}
             </CardTitle>
-            <CardDescription>{{ project.repo_proposals?.length ?? 0 }} proposals</CardDescription>
+            <CardDescription>{{ t('project.proposalCount', { n: project.repo_proposals?.length ?? 0 }) }}</CardDescription>
           </CardHeader>
           <CardContent class="space-y-3">
             <div v-for="p in project.repo_proposals" :key="p.id" class="rounded-md border p-3">
               <div class="flex items-center justify-between gap-3">
                 <div class="min-w-0 font-medium">{{ p.owner_name }} / {{ p.repo_name }}</div>
-                <Badge variant="outline">{{ p.status }}</Badge>
+                <Badge variant="outline">{{ proposalStatusLabel(p.status) }}</Badge>
               </div>
-              <p class="mt-1 text-sm text-muted-foreground">{{ p.description || p.reason || 'No description' }}</p>
+              <p class="mt-1 text-sm text-muted-foreground">{{ p.description || p.reason || t('project.noDescription') }}</p>
               <p v-if="p.module_boundary" class="mt-2 whitespace-pre-wrap text-xs text-muted-foreground">{{ p.module_boundary }}</p>
             </div>
-            <p v-if="!project.repo_proposals?.length" class="text-sm text-muted-foreground">No repo proposals.</p>
+            <p v-if="!project.repo_proposals?.length" class="text-sm text-muted-foreground">{{ t('project.noRepoProposals') }}</p>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader>
-            <CardTitle class="text-base">Propose repo</CardTitle>
+            <CardTitle class="text-base">{{ t('project.proposeRepo') }}</CardTitle>
           </CardHeader>
           <CardContent>
             <form class="space-y-3" @submit.prevent="createProposal">
               <div class="grid grid-cols-2 gap-2">
-                <Input v-model="proposalForm.owner_name" placeholder="owner" />
-                <Input v-model="proposalForm.repo_name" placeholder="repo" />
+                <Input v-model="proposalForm.owner_name" :placeholder="t('project.owner')" />
+                <Input v-model="proposalForm.repo_name" :placeholder="t('project.repo')" />
               </div>
-              <Input v-model="proposalForm.description" placeholder="description" />
-              <Textarea v-model="proposalForm.reason" rows="3" placeholder="reason" />
-              <Textarea v-model="proposalForm.module_boundary" rows="4" placeholder="module boundary" />
-              <Button type="submit" class="w-full">Propose</Button>
+              <Input v-model="proposalForm.description" :placeholder="t('project.description')" />
+              <Textarea v-model="proposalForm.reason" rows="3" :placeholder="t('project.reason')" />
+              <Textarea v-model="proposalForm.module_boundary" rows="4" :placeholder="t('project.moduleBoundary')" />
+              <Button type="submit" class="w-full">{{ t('project.submitProposal') }}</Button>
             </form>
           </CardContent>
         </Card>

@@ -48,7 +48,7 @@ async function onLogout() {
 
 const workspaceItems = computed<NavItem[]>(() => [
   { key: 'dashboard', to: '/', icon: LayoutDashboard, label: t('nav.dashboard') },
-  { key: 'projects', to: '/projects', icon: Boxes, label: 'Projects' },
+  { key: 'projects', to: '/projects', icon: Boxes, label: t('nav.projects') },
   { key: 'repos', to: '/repos', icon: FolderGit2, label: t('nav.repos') },
 ])
 
