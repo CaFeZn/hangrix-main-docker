@@ -40,31 +40,31 @@ type Project struct {
 }
 
 type ProjectRepo struct {
-	ID        int64
-	ProjectID int64
-	RepoID    int64
-	OwnerName string
-	RepoName  string
-	Purpose   string
-	Role      string
-	CreatedBy int64
-	CreatedAt time.Time
+	ID        int64     `json:"id"`
+	ProjectID int64     `json:"project_id"`
+	RepoID    int64     `json:"repo_id"`
+	OwnerName string    `json:"owner_name"`
+	RepoName  string    `json:"repo_name"`
+	Purpose   string    `json:"purpose"`
+	Role      string    `json:"role"`
+	CreatedBy int64     `json:"created_by"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type ProjectIssueLink struct {
-	ID          int64
-	ProjectID   int64
-	RepoID      int64
-	IssueID     int64
-	OwnerName   string
-	RepoName    string
-	IssueNumber int64
-	IssueTitle  string
-	IssueState  string
-	Kind        string
-	Summary     string
-	CreatedBy   int64
-	CreatedAt   time.Time
+	ID          int64     `json:"id"`
+	ProjectID   int64     `json:"project_id"`
+	RepoID      int64     `json:"repo_id"`
+	IssueID     int64     `json:"issue_id"`
+	OwnerName   string    `json:"owner_name"`
+	RepoName    string    `json:"repo_name"`
+	IssueNumber int64     `json:"issue_number"`
+	IssueTitle  string    `json:"issue_title"`
+	IssueState  string    `json:"issue_state"`
+	Kind        string    `json:"kind"`
+	Summary     string    `json:"summary"`
+	CreatedBy   int64     `json:"created_by"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type RepoProposalStatus string
@@ -86,20 +86,20 @@ func (s RepoProposalStatus) Valid() bool {
 }
 
 type RepoProposal struct {
-	ID             int64
-	ProjectID      int64
-	SourceRepoID   *int64
-	SourceIssueID  *int64
-	OwnerName      string
-	RepoName       string
-	Description    string
-	Reason         string
-	ModuleBoundary string
-	Status         RepoProposalStatus
-	TargetRepoID   *int64
-	CreatedBy      int64
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID             int64              `json:"id"`
+	ProjectID      int64              `json:"project_id"`
+	SourceRepoID   *int64             `json:"source_repo_id,omitempty"`
+	SourceIssueID  *int64             `json:"source_issue_id,omitempty"`
+	OwnerName      string             `json:"owner_name"`
+	RepoName       string             `json:"repo_name"`
+	Description    string             `json:"description"`
+	Reason         string             `json:"reason"`
+	ModuleBoundary string             `json:"module_boundary"`
+	Status         RepoProposalStatus `json:"status"`
+	TargetRepoID   *int64             `json:"target_repo_id,omitempty"`
+	CreatedBy      int64              `json:"created_by"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
 }
 
 var (
